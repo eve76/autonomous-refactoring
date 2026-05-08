@@ -1,0 +1,3 @@
+anthropic>=0.40.0
+lizard>=1.17.10
+modified_cognitive_complexity @ git+https://github.com/fkie-cad/cognitive-complexity-mod.git

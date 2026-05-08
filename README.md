@@ -1,0 +1,290 @@
+# Multi-Agent Refactoring Experiment
+
+
+The system runs an analyst → backlog → orchestrator → programmer →
+merge-gate loop on a target git repository, driving the total
+static-analysis penalty score downward until a stagnation criterion
+stops it.
+
+---
+
+## Architecture
+
+
+- **Coordination layer** (deterministic Python). Owns all shared state
+  on the main thread, drains a thread-safe message queue, persists the
+  product backlog atomically, and dispatches agents via thread pools.
+- **Agent layer** (LLM-based judgment). Three roles:
+  - **Orchestrator** — synchronous Anthropic SDK call. Not a
+    persistent process; invoked at task-assignment time and again
+    when programmers look stuck.
+  - **Analyst** — Claude CLI subprocess. Scans the accepted
+    (main-branch) source tree in its own detached worktree and emits
+    `ISSUE:` lines.
+  - **Programmer** — Claude CLI subprocess. Refactors flagged code
+    inside its own feature-branch worktree and merges through the
+    merge gate.
+
+Default population: 1 orchestrator, 3 analysts, 3 programmers.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Coordination layer (main thread)            │
+│   ┌──────────┐   ┌──────────┐   ┌──────────────┐   ┌─────────┐  │
+│   │ backlog  │   │ message  │   │ stagnation   │   │ git mgr │  │
+│   │  store   │   │  queue   │   │   tracker    │   │worktrees│  │
+│   └──────────┘   └──────────┘   └──────────────┘   └─────────┘  │
+│         │             ▲                                         │
+│         │  drain      │ post                                    │
+│         ▼             │                                         │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │            ThreadPoolExecutor (programmers)             │   │
+│   │            ThreadPoolExecutor (analysts)                │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                          │                                      │
+│                          │ subprocess (claude CLI)              │
+│                          ▼                                      │
+│           ┌──────────────────────────────────┐                  │
+│           │ ANALYST_n / PROG_n  (per process)│                  │
+│           └──────────────────────────────────┘                  │
+└─────────────────────────────────────────────────────────────────┘
+
+Synchronous LLM call (Anthropic SDK direct):
+   coordinator ──► Orchestrator ──► AssignmentDecision
+                                ──► StuckDecision
+```
+
+---
+
+## Directory layout
+
+```
+experiment/
+├── main.py                    # CLI entry: parses args -> Coordinator.run
+├── config.py                  # Central configuration dataclass
+├── requirements.txt
+├── bin/duplo                  # Duplo binary 
+│
+├── coordination/              # Deterministic Python (single writer)
+│   ├── coordinator.py         #   main loop, dispatch, stuck handling
+│   ├── backlog.py             #   thread-safe JSON-backed product backlog
+│   ├── git_manager.py         #   worktree provisioning + sparse-checkout
+│   ├── message_queue.py       #   typed agent → coordinator messages
+│   └── stagnation.py          #   stopping-criterion tracker
+│
+├── agents/                    # LLM-driven roles
+│   ├── orchestrator.py        #   sync Anthropic SDK calls (assign + stuck)
+│   ├── analyst.py             #   claude-CLI subprocess; emits ISSUE: lines
+│   ├── programmer.py          #   claude-CLI subprocess; refactor + gate
+│   ├── agent_runner.py        #   shared subprocess + log streamer
+│   └── log_parser.py          #   stream-json -> assistant text extractor
+│
+├── analysis/                  # Quality measurement
+│   ├── penalty.py             #   hyperbolic penalty
+│   └── tools.py               #   Lizard / cognitive-complexity / Duplo
+│
+├── merge_gate/                # Per-issue evaluation pipeline
+│   ├── gate.py                #   rebase → penalty → build → test → ff-merge
+│   └── cli.py                 #   entry programmers invoke from worktree
+│
+└── prompts/
+    ├── orchestrator_assignment.txt
+    ├── orchestrator_stuck.txt
+    ├── analyst.txt
+    └── programmer.txt
+```
+
+---
+
+## Quality metrics and penalty
+
+All five metrics from the paper are wired:
+
+| Metric                | Tool                              | Threshold | Notes                                    |
+|-----------------------|-----------------------------------|-----------|------------------------------------------|
+| Cyclomatic complexity | Lizard                            | 15        | per function                             |
+| Logical lines of code | Lizard (`nloc`)                   | 30        | per function                             |
+| Parameter count       | Lizard                            | 5         | per function                             |
+| Cognitive complexity  | `modified_cognitive_complexity`   | 15        | per function, joined to Lizard by name   |
+| Duplicate-line ratio  | Duplo                             | —         | codebase-level                           |
+
+Penalty function :
+
+- Per-function :  `p_m(x) = 100 · (1 − T_m / max(T_m, x))`
+- Duplicates : `p_dup(r) = 100 · r / (r + 0.1)`
+
+Total penalty is the sum of all per-function penalties across all
+functions and metrics, plus the duplicate-ratio penalty. The same
+implementation is shared by the merge gate (`MergeGate._compute_penalty`)
+and the backlog impact estimator (`estimate_reduction_from_message`)
+so they cannot drift.
+
+Class-qualified Lizard names like `Foo::bar` fall back to the bare
+name `bar` when joining cognitive-complexity scores, since the two
+tools report names differently.
+
+---
+
+## Lifecycle
+
+1. **Init.** The coordinator
+   - creates one feature-branch worktree per programmer
+     (sparse-checkout when targeting a subdirectory),
+   - creates one detached-HEAD worktree per analyst pinned to `main`,
+   - runs Lizard + cognitive-complexity + Duplo to compute the
+     baseline penalty,
+   - writes `.gate_config.json` into each programmer worktree so the
+     merge-gate CLI knows how to operate.
+
+2. **Loop tick (~1 s).**
+   - Drain the message queue: apply backlog mutations, update
+     `current_penalty`, advance the stagnation counter.
+   - Reap finished thread-pool futures.
+   - If there is *actionable* work (idle programmer + TODO items, or
+     idle analyst when backlog empty / stagnation looming), call the
+     orchestrator for an assignment plan.
+   - Submit `session.run(...)` to the appropriate pool.
+   - Two-tier stuck handling (see below).
+
+3. **Programmer subprocess** (per assigned issue):
+   - reset worktree → read flagged file → edit → commit
+   - call `python merge_gate/cli.py --penalty-before X` from the
+     worktree root. The gate rebases onto main, recomputes penalty,
+     builds, runs tests, and fast-forward-merges into main. On
+     ff-merge race, retries up to 3 times.
+   - emits `RESULT: ISSUE-X done|skipped ...` so the coordinator can
+     parse the outcome from the stream-json log.
+
+4. **Analyst subprocess** (per dispatch):
+   - the coordinator resets the analyst's worktree to `origin/main`
+     so it sees only accepted code, then spawns the CLI session.
+   - the analyst optionally runs the static-analysis tools and emits
+     one `ISSUE:` line per violation; the coordinator parses, dedupes,
+     and adds them to the backlog.
+
+5. **Stop** when the stagnation counter reaches its limit.
+
+---
+
+## Stopping criterion
+
+
+| Trigger                                                              | Stagnation tick? |
+|----------------------------------------------------------------------|------------------|
+| A merge yields penalty reduction below `min_merge_gain` (10 units)   | yes              |
+| A programmer is killed for exceeding `programmer_timeout_sec` (30 m) | yes              |
+| Orchestrator discretionary terminate (stuck but not at hard timeout) | no               |
+
+The system halts once the counter reaches `stagnation_limit`
+(default 3) without an intervening high-gain merge.
+
+---
+
+## Stuck-agent handling
+
+The coordinator runs two tiers in `_check_stuck_agents`:
+
+1. **Hard timeout.** Any programmer past `programmer_timeout_sec` is
+   killed, its issues are returned to TODO, its worktree is reset,
+   and the stagnation counter ticks.
+
+2. **Discretionary stuck-eval.** For any programmer past
+   `issue_timeout_sec`, the coordinator builds a `StuckAgentReport`
+   (runtime, tail of assistant log, `edits_made`, `gate_invocations`,
+   assigned issues) and asks the orchestrator to `terminate`,
+   `keep`, or `mark_infeasible` per issue. Eval is rate-limited to
+   once per `STUCK_EVAL_INTERVAL_SEC` (60 s) so the orchestrator is
+   not spammed.
+
+`edits_made` and `gate_invocations` are tracked by substring-matching
+the streamed Claude CLI JSON for `Edit / Write / MultiEdit` tool calls
+and `Bash` calls that contain `merge_gate/cli.py`. Cheap and good
+enough for orchestrator context.
+
+---
+
+## Key design choices
+
+- **Single-writer protocol.** Only the coordination layer mutates
+  shared state (backlog, penalty, stagnation, futures dicts). Agent
+  threads communicate by posting messages and never wait.
+- **Atomic backlog persistence.** Writes go through
+  `tempfile.mkstemp` + `os.replace`, so a crash never leaves a partial
+  JSON.
+- **Worktree isolation per agent.** Each programmer commits on its
+  own feature branch and only touches main via fast-forward through
+  the merge gate; never via merge commits. Each analyst sits on a
+  detached HEAD that is reset to `origin/main` before every run.
+- **Hot-path discipline.** The coordinator skips the orchestrator
+  LLM call entirely on ticks where no useful assignment could result,
+  so the per-tick cost is dominated by `queue.empty()` checks.
+- **Bounded race recovery.** On ff-merge contention the gate retries
+  up to 3 full rebase-build-test cycles, then surfaces the failure
+  rather than recursing.
+- **Backlog deduplication.** New issues are matched against existing
+  backlog and completed items by `(file_path, line, issue_type)`.
+
+---
+
+## Configuration (`config.py`)
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `repo_root` | required | Target git repository |
+| `target_subdir` | `.` | Subtree to refactor (sparse-checkout when not `.`) |
+| `work_root` | required | Hosts worktrees + logs + backlog.json |
+| `num_analysts`, `num_programmers` | 3, 3 | Pool sizes |
+| `claude_cli` | `claude` | Path / name of the Claude Code CLI |
+| `orchestrator_model` / `agent_model` | `claude-opus-4-7` | Models |
+| `min_merge_gain` | 10.0 | Stagnation threshold (penalty units) |
+| `stagnation_limit` | 3 | Consecutive low-gain merges before stop |
+| `programmer_timeout_sec` | 1800 | Hard kill timeout per programmer |
+| `issue_timeout_sec` | 600 | Soft per-issue limit + stuck-eval trigger |
+| `thresholds` | `{ccn:15, cognitive:15, nloc:30, param:5, duplicates:0}` | Penalty thresholds (paper §4.5.1) |
+| `duplo_binary` | `""` | Path to the Duplo binary (empty disables duplicates) |
+| `duplo_min_block_lines` | 6 | Duplo `-ml` flag |
+| `build_cmd` / `test_cmd` | `["true"]` | Override per project |
+| `main_branch` | `main` | Branch the gate fast-forwards into |
+
+---
+
+## Setup and running
+
+Python 3.13+ is required (`modified_cognitive_complexity` enforces it).
+
+```bash
+# 1. Virtualenv + Python deps
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Duplo binary (download the matching release for your OS)
+mkdir -p bin
+curl -sL https://github.com/dlidstrom/Duplo/releases/latest/download/duplo-macos.zip \
+  -o /tmp/duplo.zip
+unzip -o /tmp/duplo.zip -d bin/
+chmod +x bin/duplo
+
+# 3. API key for the orchestrator (analysts/programmers run via the CLI;
+#    the orchestrator uses the SDK directly).
+export ANTHROPIC_API_KEY=...
+
+# 4. Run
+python main.py \
+    --repo /path/to/target/repo \
+    --subdir src \
+    --work-root /tmp/refactor_run \
+    --analysts 3 --programmers 3
+```
+
+`config.duplo_binary` defaults to `""` (Duplo disabled). Set it to
+`bin/duplo` (or wherever you put the binary) to include the
+duplicate-line metric in the penalty.
+
+Outputs land under `--work-root`:
+
+- `backlog.json` — current product backlog (atomically rewritten)
+- `logs/PROG_n.log`, `logs/ANALYST_n.log` — per-agent stream-json logs
+- `PROG_n/` — per-programmer feature-branch worktree
+- `ANALYST_n/` — per-analyst detached-HEAD worktree
+
+---

@@ -1,0 +1,23 @@
+You are the orchestrator. One or more programmers appear to be stuck
+(long runtime, possibly no edits, possibly never reached the merge gate).
+Decide which to terminate, which to keep running, and whether any
+assigned issues should be marked infeasible so they leave the backlog.
+
+STUCK AGENT REPORTS (JSON)
+{reports_json}
+
+GUIDANCE
+- Terminate if the agent has consumed substantial runtime AND has
+  made no edits AND has never invoked the merge gate.
+- Keep if the agent is making progress (edits + gate attempts) even
+  if slow.
+- Mark an issue infeasible only when the recent log clearly indicates
+  an architectural blocker, missing access, or repeated failed attempts.
+
+OUTPUT FORMAT
+On separate lines:
+    TERMINATE: PROG_<n> [, PROG_<n>]
+    KEEP:      PROG_<n> [, PROG_<n>]
+    INFEASIBLE: ISSUE-<id> - <short reason> [;ISSUE-<id> - <reason>]
+    REASONING: <one paragraph>
+Omit a header if its list is empty.
