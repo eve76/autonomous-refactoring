@@ -1,11 +1,12 @@
 """CLI entry the programmer agent invokes from inside its worktree.
 
 Usage (run from inside the worktree):
-    python /path/to/experiment/merge_gate/cli.py --penalty-before <float>
+    python /path/to/experiment/merge_gate/cli.py
 
-Reads .gate_config.json (written by the coordinator at init time) for
-repo_root / target_subdir / thresholds / build & test commands. Prints
-a JSON result line on stdout.
+The gate re-measures main's penalty itself; no caller-supplied value
+is needed. Reads .gate_config.json (written by the coordinator at init
+time) for repo_root / target_subdir / thresholds / weights / build &
+test commands / reverted_dir. Prints a JSON result line on stdout.
 """
 
 import argparse
@@ -25,7 +26,10 @@ def _load_config(worktree: Path) -> dict:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--penalty-before", type=float, required=True)
+    p.add_argument(
+        "--worktree-idx", type=int, default=0,
+        help="Programmer index used in the gate's commit message",
+    )
     args = p.parse_args()
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -33,6 +37,9 @@ def main() -> int:
 
     worktree = Path.cwd()
     cfg = _load_config(worktree)
+
+    reverted_dir = cfg.get("reverted_dir")
+    reverted_dir_path = Path(reverted_dir) if reverted_dir else None
 
     gate = MergeGate(
         worktree=worktree,
@@ -43,9 +50,14 @@ def main() -> int:
         test_cmd=cfg["test_cmd"],
         main_branch=cfg.get("main_branch", "main"),
         duplo_binary=cfg.get("duplo_binary", ""),
-        duplo_min_block_lines=int(cfg.get("duplo_min_block_lines", 6)),
+        duplo_min_block_lines=int(cfg.get("duplo_min_block_lines", 10)),
+        lizard_binary=cfg.get("lizard_binary", "lizard"),
+        lizard_language=cfg.get("lizard_language", "cpp"),
+        weights=cfg.get("weights"),
+        reverted_dir=reverted_dir_path,
+        worktree_idx=args.worktree_idx,
     )
-    result = gate.run(penalty_before=args.penalty_before)
+    result = gate.run()
     print(json.dumps(asdict(result)))
     return 0 if result.success else 1
 

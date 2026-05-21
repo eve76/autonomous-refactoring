@@ -80,15 +80,20 @@ class ProgrammerSession:
     # -- internals -----------------------------------------------------
 
     def _write_gate_config(self) -> None:
+        reverted_dir = self.cfg.work_root / self.cfg.reverted_dir
         cfg_payload = {
             "repo_root": str(self.cfg.repo_root),
             "target_subdir": self.cfg.target_subdir,
             "thresholds": self.cfg.thresholds,
+            "weights": self.cfg.weights,
             "build_cmd": self.cfg.build_cmd,
             "test_cmd": self.cfg.test_cmd,
             "main_branch": self.cfg.main_branch,
             "duplo_binary": self.cfg.duplo_binary,
             "duplo_min_block_lines": self.cfg.duplo_min_block_lines,
+            "lizard_binary": self.cfg.lizard_binary,
+            "lizard_language": self.cfg.lizard_language,
+            "reverted_dir": str(reverted_dir),
         }
         (self.worktree / self.cfg.gate_config_filename).write_text(
             json.dumps(cfg_payload, indent=2)
@@ -149,6 +154,11 @@ class ProgrammerSession:
         ))
 
     def _build_task_prompt(self, issue_specs: list[dict]) -> str:
+        # The gate handles staging/commit itself (gnomad-kiro parity),
+        # and re-measures main's penalty — so the programmer does not
+        # need to commit or pass --penalty-before.
+        worktree_idx = self._worktree_idx()
+        gate_cmd = f"python {GATE_CLI} --worktree-idx {worktree_idx}"
         lines = [
             "You have been assigned the following backlog issues:",
             "",
@@ -163,11 +173,12 @@ class ProgrammerSession:
             "Process them ONE AT A TIME, in order. For each issue:",
             "  1. Reset your worktree clean and pull latest main.",
             "  2. Read the flagged file, refactor per your strategy guide.",
-            "  3. Commit on your feature branch.",
-            "  4. Invoke the merge gate from the worktree root:",
-            f"        python {GATE_CLI} --penalty-before <current penalty>",
-            "     The gate prints a JSON line with success/penalty/merged.",
-            "  5. If the gate succeeded, emit:",
+            "  3. Invoke the merge gate from the worktree root:",
+            f"        {gate_cmd}",
+            "     The gate stages your edits, commits, rebases, re-measures",
+            "     the penalty, builds, tests, and (on success) fast-forwards",
+            "     into main. It prints a JSON line with success/penalty/merged.",
+            "  4. If the gate succeeded, emit:",
             "        RESULT: <ISSUE-ID> - done - merged at penalty <before> -> <after>",
             "     If it could not be made to pass, emit:",
             "        RESULT: <ISSUE-ID> - skipped - <short reason>",
@@ -175,6 +186,14 @@ class ProgrammerSession:
             "Stop after all assigned issues have been resolved (done or skipped).",
         ])
         return "\n".join(lines)
+
+    def _worktree_idx(self) -> int:
+        # PROG_<n> -> n (1-based, matches gnomad-kiro commit-message
+        # convention). Defaults to 0 if the id isn't in that shape.
+        try:
+            return int(self.programmer_id.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            return 0
 
     def _parse_results_from_log(self) -> list[dict]:
         text = extract_assistant_text(self.log_path) if self.log_path else ""

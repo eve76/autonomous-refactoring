@@ -25,7 +25,6 @@ class Config:
     stagnation_limit: int = 3
 
     programmer_timeout_sec: int = 30 * 60
-    issue_timeout_sec: int = 10 * 60
 
     backlog_drain_interval_sec: float = 1.0
 
@@ -41,13 +40,37 @@ class Config:
         "duplicates": 0,
     })
 
+    # Per-metric weights (gnomad-kiro parity). Setting any to 0 disables
+    # that metric's contribution to the penalty totals.
+    weights: dict = field(default_factory=lambda: {
+        "ccn": 1,
+        "nloc": 1,
+        "cognitive": 1,
+        "param": 1,
+        "duplicates": 1,
+    })
+
     # Duplo binary used by the merge gate and the coordinator's
     # baseline measurement. Empty string -> duplicates not measured.
     duplo_binary: str = ""
-    duplo_min_block_lines: int = 6
+    # gnomad-kiro hardcodes -ml 10
+    duplo_min_block_lines: int = 10
+
+    # Lizard CLI binary. gnomad-kiro shells out to lizard rather than
+    # using the Python API; we follow suit but leave the path on PATH
+    # by default so this is portable across machines.
+    lizard_binary: str = "lizard"
+    # Target language for Lizard / file-suffix filter. gnomad-kiro is
+    # C/C++ only; setting "go" (or anything non-cpp) makes the pipeline
+    # walk Go files and skip the cognitive-complexity tool (which only
+    # supports C/C++).
+    lizard_language: str = "cpp"
 
     log_dir: Path = field(default_factory=lambda: Path("logs"))
     backlog_path: Path = field(default_factory=lambda: Path("backlog.json"))
+    # Failed gate runs save a .patch here instead of resetting the
+    # worktree (gnomad-kiro parity).
+    reverted_dir: Path = field(default_factory=lambda: Path("reverted_patches"))
 
     # Build / test commands invoked by the merge gate inside each
     # worktree. Default to no-op so the skeleton runs end-to-end on

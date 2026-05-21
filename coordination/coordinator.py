@@ -5,6 +5,7 @@ queue in a single-writer loop, persists the backlog atomically, and
 dispatches agents based on orchestrator decisions.
 """
 
+import signal
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
@@ -20,9 +21,7 @@ from coordination.git_manager import (
     reset_worktree,
 )
 from coordination.stagnation import StagnationTracker
-from agents.orchestrator import (
-    Orchestrator, AssignmentDecision, StuckAgentReport,
-)
+from agents.orchestrator import Orchestrator, AssignmentDecision
 from agents.analyst import AnalystSession
 from agents.programmer import ProgrammerSession
 from analysis.tools import run_static_analysis
@@ -58,7 +57,8 @@ class Coordinator:
         self.programmer_futures: dict[str, Future] = {}
         self.analyst_futures: dict[str, Future] = {}
 
-        self._last_stuck_eval: float = 0.0
+        self.stop_reason: str = ""
+        signal.signal(signal.SIGTERM, self._on_sigterm)
 
     # -- lifecycle -----------------------------------------------------
 
@@ -110,18 +110,36 @@ class Coordinator:
 
         self.backlog.load_or_init()
 
-        records, dup_ratio = run_static_analysis(
+        lizard_records, cognitive_records, dup_ratio = run_static_analysis(
             self.cfg.target_path, self.cfg.thresholds,
             duplo_binary=self.cfg.duplo_binary,
             duplo_min_block_lines=self.cfg.duplo_min_block_lines,
+            lizard_binary=self.cfg.lizard_binary,
+            language=self.cfg.lizard_language,
         )
         self.baseline_penalty = compute_total_penalty(
-            records, self.cfg.thresholds, dup_ratio,
+            lizard_records, cognitive_records,
+            self.cfg.thresholds, dup_ratio, self.cfg.weights,
         )
         self.current_penalty = self.baseline_penalty
 
         self.programmer_pool = ThreadPoolExecutor(max_workers=self.cfg.num_programmers)
         self.analyst_pool = ThreadPoolExecutor(max_workers=self.cfg.num_analysts)
+
+    def _on_sigterm(self, signum, frame) -> None:
+        """SIGTERM handler (gnomad-kiro parity).
+
+        Set wall_timeout so the main loop exits its tick. Active agents
+        are killed; their worktrees are intentionally left as-is so any
+        in-progress changes can be inspected post-mortem.
+        """
+        self.stop_reason = "wall_timeout"
+        for pid, session in self.programmer_sessions.items():
+            if pid in self.programmer_futures:
+                try:
+                    session.kill()
+                except Exception:
+                    pass
 
     def _shutdown(self) -> None:
         if self.programmer_pool is not None:
@@ -137,7 +155,7 @@ class Coordinator:
     # -- main loop -----------------------------------------------------
 
     def _main_loop(self) -> None:
-        while not self.stagnation.should_stop():
+        while not self.stagnation.should_stop() and self.stop_reason == "":
             self._drain_queue()
             self._reap_finished_futures()
             self._dispatch_if_needed()
@@ -157,7 +175,7 @@ class Coordinator:
         if msg.kind == mq.ADD_ISSUES:
             for raw in msg.payload.get("issues", []):
                 reduction, parsed = estimate_reduction_from_message(
-                    raw.get("message", ""), self.cfg.thresholds,
+                    raw.get("message", ""), self.cfg.thresholds, self.cfg.weights,
                 )
                 impact = "high" if reduction >= self.cfg.min_merge_gain else "low"
                 issue = Issue(
@@ -302,72 +320,25 @@ class Coordinator:
 
     # -- stuck-agent monitoring ---------------------------------------
 
-    STUCK_EVAL_INTERVAL_SEC = 60.0
-
     def _check_stuck_agents(self) -> None:
-        """Two-tier stuck handling.
+        """Hard-timeout only (gnomad-kiro parity).
 
-        1. Hard timeout: any programmer past `programmer_timeout_sec`
-           is killed, its issues are returned to TODO, its worktree is
-           reset, and the stagnation counter ticks (paper §4.5.2).
-        2. Discretionary: programmers running past `issue_timeout_sec`
-           are reported to the orchestrator at most once every
-           STUCK_EVAL_INTERVAL_SEC; the orchestrator's terminate /
-           keep / mark-infeasible decision is then applied. These do
-           NOT increment the stagnation counter.
+        Any programmer past `programmer_timeout_sec` is killed, its
+        issues are returned to TODO, its worktree is reset, and the
+        stagnation counter ticks. No discretionary orchestrator
+        evaluation — gnomad-kiro has a single-tier policy.
         """
-        # 1. hard timeout
         for pid, session in list(self.programmer_sessions.items()):
             if pid not in self.programmer_futures:
                 continue
             if session.runtime_sec() > self.cfg.programmer_timeout_sec:
-                self._terminate_programmer(pid, session, count_as_stagnation=True)
+                self._terminate_programmer(pid, session)
 
-        # 2. discretionary stuck-eval
-        if time.time() - self._last_stuck_eval < self.STUCK_EVAL_INTERVAL_SEC:
-            return
-        reports = self._build_stuck_reports()
-        if not reports:
-            return
-        self._last_stuck_eval = time.time()
-        decision = self.orchestrator.evaluate_stuck(reports)
-        self._apply_stuck_decision(decision)
-
-    def _build_stuck_reports(self) -> list[StuckAgentReport]:
-        reports: list[StuckAgentReport] = []
-        for pid, session in self.programmer_sessions.items():
-            if pid not in self.programmer_futures:
-                continue
-            runtime = session.runtime_sec()
-            if runtime <= self.cfg.issue_timeout_sec:
-                continue
-            reports.append(StuckAgentReport(
-                agent_id=pid,
-                runtime_sec=runtime,
-                recent_log=session.tail_log(),
-                edits_made=session.edits_made(),
-                ran_gate=session.gate_invocations() > 0,
-                assigned_issues=list(session.assigned_issues),
-            ))
-        return reports
-
-    def _apply_stuck_decision(self, decision) -> None:
-        for iid, reason in decision.mark_infeasible.items():
-            self.backlog.mark_skipped(iid, reason)
-        for pid in decision.terminate:
-            session = self.programmer_sessions.get(pid)
-            if session is None or pid not in self.programmer_futures:
-                continue
-            self._terminate_programmer(pid, session, count_as_stagnation=False)
-        if decision.terminate or decision.mark_infeasible:
-            self.backlog.persist()
-
-    def _terminate_programmer(self, pid: str, session, count_as_stagnation: bool) -> None:
+    def _terminate_programmer(self, pid: str, session) -> None:
         session.kill()
         for iid in session.assigned_issues:
             self.backlog.return_to_todo(iid)
-        if count_as_stagnation:
-            self.stagnation.record_timeout()
+        self.stagnation.record_timeout()
         worktree = self.programmer_worktrees.get(pid)
         if worktree is not None:
             try:

@@ -5,11 +5,11 @@ Per-function metrics (CCN, Cog, LLOC, Param):
 Codebase-level duplicate-line ratio:
     p_dup(r) = 100 * r / (r + k),  k = 0.1
 
-Total penalty = sum of all per-function penalties (over functions and
-metrics) + the duplicate-ratio penalty.
-
-The same function is used by both the merge gate and the backlog
-impact estimator, so they remain consistent.
+Total penalty = weighted sum of all per-function penalties + the
+duplicate-ratio penalty. Lizard records (ccn/nloc/param) and cognitive
+records are kept as separate lists, matching gnomad-kiro: a function
+detected only by the cognitive tool still contributes its cognitive
+penalty even when Lizard doesn't see it.
 """
 
 import re
@@ -17,9 +17,8 @@ from typing import Iterable
 
 DUP_K = 0.1
 
-# Per-function metrics that use Eq 4.4. The dict key in `thresholds`
-# matches the field name in each metric record produced by tools.py.
-PER_FUNCTION_METRICS = ("ccn", "cognitive", "nloc", "param")
+LIZARD_METRICS = ("ccn", "nloc", "param")
+DEFAULT_WEIGHTS = {"ccn": 1, "nloc": 1, "cognitive": 1, "param": 1, "duplicates": 1}
 
 
 def function_penalty(value: float, threshold: float) -> float:
@@ -37,20 +36,35 @@ def duplicate_penalty(ratio: float) -> float:
 
 
 def compute_total_penalty(
-    metrics: Iterable[dict],
+    lizard_records: Iterable[dict],
+    cognitive_records: Iterable[dict],
     thresholds: dict[str, float],
     duplicate_ratio: float = 0.0,
+    weights: dict[str, float] | None = None,
 ) -> float:
+    w = weights if weights is not None else DEFAULT_WEIGHTS
     total = 0.0
-    for m in metrics:
-        for key in PER_FUNCTION_METRICS:
+    for m in lizard_records:
+        for key in LIZARD_METRICS:
             if key not in thresholds:
+                continue
+            weight = float(w.get(key, 1))
+            if weight == 0:
                 continue
             value = m.get(key)
             if value is None:
                 continue
-            total += function_penalty(float(value), float(thresholds[key]))
-    total += duplicate_penalty(float(duplicate_ratio))
+            total += weight * function_penalty(float(value), float(thresholds[key]))
+    cog_weight = float(w.get("cognitive", 1))
+    if cog_weight != 0 and "cognitive" in thresholds:
+        for m in cognitive_records:
+            value = m.get("cognitive")
+            if value is None:
+                continue
+            total += cog_weight * function_penalty(float(value), float(thresholds["cognitive"]))
+    dup_weight = float(w.get("duplicates", 1))
+    if dup_weight != 0:
+        total += dup_weight * duplicate_penalty(float(duplicate_ratio))
     return total
 
 
@@ -78,7 +92,9 @@ _KEY_ALIAS = {
 
 
 def estimate_reduction_from_message(
-    message: str, thresholds: dict[str, float]
+    message: str,
+    thresholds: dict[str, float],
+    weights: dict[str, float] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Parse metric values out of an analyst-issued message.
 
@@ -87,6 +103,7 @@ def estimate_reduction_from_message(
     For duplicates, assumes the duplicate block is removed (penalty
     contribution -> 0).
     """
+    w = weights if weights is not None else DEFAULT_WEIGHTS
     parsed: dict[str, float] = {}
     for n1, v1, v2, n2 in _METRIC_RE.findall(message):
         name, value = (n1, v1) if n1 else (n2, v2)
@@ -100,12 +117,15 @@ def estimate_reduction_from_message(
         threshold = thresholds.get(key)
         if threshold is None:
             continue
-        if key in PER_FUNCTION_METRICS:
-            reduction += function_penalty(value, threshold)
+        weight = float(w.get(key, 1))
+        if weight == 0:
+            continue
+        if key in LIZARD_METRICS or key == "cognitive":
+            reduction += weight * function_penalty(value, threshold)
         elif key == "duplicates":
             # Assume eliminating the block removes its share of the
             # current duplicate-ratio penalty. The message normally
             # carries the percentage (e.g. duplicates=2.4); convert.
             ratio = value / 100.0 if value > 1.0 else value
-            reduction += duplicate_penalty(ratio)
+            reduction += weight * duplicate_penalty(ratio)
     return reduction, parsed

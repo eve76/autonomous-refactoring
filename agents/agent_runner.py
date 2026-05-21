@@ -6,6 +6,8 @@ flag and the task prompt streamed in on stdin. Standard output is
 streamed line-by-line to a per-agent log file for debugging.
 """
 
+import os
+import signal
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -28,10 +30,19 @@ class AgentProcess:
         return self.process.poll() is None
 
     def kill(self) -> None:
+        """Kill the entire process group (gnomad-kiro parity).
+
+        os.killpg(getpgid(pid), SIGKILL) reaps the agent and any
+        grandchildren (build tools, git, etc.) it spawned. A plain
+        process.kill() would leave those orphaned.
+        """
         try:
-            self.process.kill()
-        except ProcessLookupError:
-            pass
+            os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            try:
+                self.process.kill()
+            except ProcessLookupError:
+                pass
         try:
             self.log_file.close()
         except Exception:
@@ -72,6 +83,9 @@ def spawn_claude_agent(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        # Put the child in its own process group so kill() can reap
+        # the whole tree via killpg (gnomad-kiro parity).
+        start_new_session=True,
     )
 
     if proc.stdin is not None:

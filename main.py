@@ -14,6 +14,8 @@ def parse_args() -> Config:
     p.add_argument("--work-root", required=True, type=Path, help="Directory to host worktrees")
     p.add_argument("--analysts", type=int, default=3)
     p.add_argument("--programmers", type=int, default=3)
+    p.add_argument("--language", default="cpp", help="Target language (cpp|go|java|python)")
+    p.add_argument("--duplo-binary", default="", help="Path to duplo binary (empty disables duplicates)")
     args = p.parse_args()
 
     return Config(
@@ -22,6 +24,8 @@ def parse_args() -> Config:
         work_root=args.work_root.resolve(),
         num_analysts=args.analysts,
         num_programmers=args.programmers,
+        lizard_language=args.language,
+        duplo_binary=args.duplo_binary,
     )
 
 
