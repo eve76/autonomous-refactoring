@@ -10,6 +10,30 @@ import json
 from pathlib import Path
 
 
+def has_successful_terminal_result(log_path: Path) -> bool:
+    """Return whether a stream-json log ended in a successful result event.
+
+    A zero process exit alone is insufficient: a truncated or malformed log
+    must not make the coordinator treat a local-lead page as reviewed.
+    """
+    if not log_path.exists():
+        return False
+    terminal = None
+    with log_path.open() as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "result":
+                terminal = obj
+    return bool(
+        terminal is not None
+        and terminal.get("is_error") is not True
+        and isinstance(terminal.get("result"), str)
+    )
+
+
 def extract_assistant_text(log_path: Path) -> str:
     if not log_path.exists():
         return ""

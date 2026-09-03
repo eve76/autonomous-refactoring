@@ -30,7 +30,7 @@ class AgentProcess:
         return self.process.poll() is None
 
     def kill(self) -> None:
-        """Kill the entire process group (gnomad-kiro parity).
+        """Kill the entire process group.
 
         os.killpg(getpgid(pid), SIGKILL) reaps the agent and any
         grandchildren (build tools, git, etc.) it spawned. A plain
@@ -58,6 +58,7 @@ def spawn_claude_agent(
     log_path: Path,
     model: str,
     extra_args: Optional[list[str]] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> AgentProcess:
     """Launch one `claude` CLI process and wire up a log streamer."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,8 +84,9 @@ def spawn_claude_agent(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=env,
         # Put the child in its own process group so kill() can reap
-        # the whole tree via killpg (gnomad-kiro parity).
+        # the whole tree via killpg.
         start_new_session=True,
     )
 
