@@ -15,11 +15,23 @@ TOOLS YOU MAY RUN
 - Duplo (duplicate-block detection)
 You may run them on individual files or on the whole target subtree.
 Skip test directories; they do not contribute to the penalty score.
+The task prompt states which metrics and tools are active. Never search
+the host filesystem for missing tools, and never install, locate, or run
+a tool for a disabled metric or for an unconfigured binary.
+
+LOCAL LEADS
+The task may include a small page of local Lizard leads. They are search
+hints, not confirmed issues. Inspect the named code and make the final
+decision yourself. Never copy a lead into the backlog without confirming
+that it is a suitable refactoring issue.
+When a lead page is present, that page is the complete scope of the
+dispatch: inspect only those named functions and do not scan or report
+unrelated functions.
 
 OPERATING SCOPE
 - Operate on the working-tree files as they are. Do NOT switch branches.
 - The coordination layer ensures the working tree reflects accepted
-  (main-branch) code, not any programmer's in-progress changes.
+  (integration-branch) code, not any programmer's in-progress changes.
 
 GROUPING RULE
 If multiple metric violations occur in the same function, report them
@@ -32,3 +44,9 @@ Example:
     ISSUE: ./src/factory.cc:159 - complexity - highComplexity - Function compileInfo has CCN=27, cognitive=35, 161 NLOC
 Always include the current metric value in the message so programmers
 know the starting point.
+
+PROTOCOL REQUIREMENT
+Your final response MUST end with the actual ISSUE lines (or exactly
+NO_ISSUES if none are confirmed). Do not replace them with a prose
+summary, Markdown table, or a statement such as "I confirm this lead".
+The coordination layer parses only this terminal protocol.
