@@ -3,13 +3,18 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import shutil
+import math
 
 from analysis import tools
 from coordination.model_pricing import require_model_price
 
 
-SUPPORTED_API_PROVIDERS = ("subscription", "anthropic", "deepseek")
+SUPPORTED_API_PROVIDERS = ("anthropic", "deepseek")
 DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+# Static analysis runs before the command-specific phases and does not have a
+# separate deadline.  Reserve a small, explicit budget for it when a dynamic
+# benchmark is enabled; otherwise a gate can be killed between valid phases.
+GATE_STATIC_ANALYSIS_MARGIN_SEC = 5 * 60
 
 
 @dataclass
@@ -34,17 +39,14 @@ class Config:
     orchestrator_no_progress_limit: int = 3
 
     claude_cli: str = "claude"
-    # Subscription mode sends every model turn through an OAuth-authenticated
-    # Claude Code CLI. Anthropic/DeepSeek remain explicit API-backed modes.
-    api_provider: str = "subscription"
+    # Both providers use the Anthropic SDK/wire format. DeepSeek exposes an
+    # official Anthropic-compatible endpoint and documents Claude Code as a
+    # supported agent harness.
+    api_provider: str = "anthropic"
     api_base_url: str = ""
     # Environment-variable *name* only. The secret value is read at runtime
     # and is never put in argv, Config serialization, or run_summary.json.
     api_key_env: str = ""
-    # Filled by the subscription-auth preflight; never contains identity or
-    # credential material and is recorded only for experimental provenance.
-    subscription_type: str = ""
-    claude_cli_version: str = ""
     orchestrator_model: str = ""
     agent_model: str = ""
     # Thinking effort for Claude Code Analyst/Programmer subprocesses only.
@@ -113,6 +115,27 @@ class Config:
         "param": 1,
         "duplicates": 1,
     })
+
+    # Dynamic benchmark policy is deliberately separate from correctness
+    # validation.  "off" preserves the historical static-only gate;
+    # "observe" writes a comparison but never changes acceptance; "enforce"
+    # rejects unavailable comparisons and regressions after build/test pass.
+    dynamic_mode: str = "off"
+    dynamic_repetitions: int = 7
+    # Diagnostic threshold only. High CV is recorded but never rejects a gate.
+    dynamic_max_cv: float = 0.10
+    dynamic_tolerance: float = 0.05
+    # These weights apply only to the profile's approved metrics.  MongoDB
+    # consumes real_time; FerretDB consumes ns/op and B/op.  The URL is never
+    # a Config value: only its environment-variable name is serialised.
+    dynamic_weights: dict = field(default_factory=lambda: {
+        "mongodb_real_time": 1.0,
+        "ferretdb_ns_per_op": 0.7,
+        "ferretdb_bytes_per_op": 0.3,
+    })
+    dynamic_ferretdb_url_env: str = "FERRETDB_BENCHMARK_POSTGRESQL_URL"
+    dynamic_bazel_binary: str = "bazel"
+    dynamic_timeout_sec: int = 60 * 60
 
     # Language-specific duplication backends. Go uses mibk/dupl; C/C++
     # retains dlidstrom/Duplo. Empty string disables that backend.
@@ -201,7 +224,10 @@ class Config:
     test_timeout_sec: int = 60 * 60
     # Last-resort bound for an active gate, including static analysis,
     # build, and test.  It must exceed both command-specific deadlines.
-    gate_timeout_sec: int = 3 * 60 * 60
+    # Four hours accommodates the default 1h build, 1h correctness test,
+    # 1h dynamic benchmark and the explicit static-analysis margin when
+    # callers enable dynamic mode directly on Config.
+    gate_timeout_sec: int = 4 * 60 * 60
     # Exact repository-relative paths that build tooling may create as
     # *untracked* files.  The merge gate still rejects tracked modifications,
     # and the list is empty by default.  This avoids teaching the gate broad
@@ -261,16 +287,6 @@ class Config:
             raise ValueError("choose only one run cost currency")
         if self.max_run_cost_cny and self.api_provider != "deepseek":
             raise ValueError("CNY cost ceiling is supported only for DeepSeek")
-        if self.api_provider == "subscription":
-            if self.api_base_url or self.api_key_env:
-                raise ValueError(
-                    "subscription mode forbids API base URLs and key variables"
-                )
-            if self.max_run_cost_usd or self.max_run_cost_cny:
-                raise ValueError(
-                    "subscription mode has no per-run billed-cost ceiling; "
-                    "use token ceilings instead"
-                )
         if self.analyst_timeout_sec <= 0:
             raise ValueError("analyst_timeout_sec must be positive")
         if self.max_gate_attempts_per_issue <= 0:
@@ -279,13 +295,39 @@ class Config:
             raise ValueError("max_issue_dispatches must be positive")
         if self.build_timeout_sec <= 0 or self.test_timeout_sec <= 0:
             raise ValueError("build/test timeouts must be positive")
-        if self.gate_timeout_sec <= max(
-            self.build_timeout_sec, self.test_timeout_sec
-        ):
-            raise ValueError(
-                "gate_timeout_sec must exceed build_timeout_sec and "
-                "test_timeout_sec"
+        if self.dynamic_mode not in ("off", "observe", "enforce"):
+            raise ValueError("dynamic_mode must be 'off', 'observe', or 'enforce'")
+        if self.dynamic_repetitions <= 0:
+            raise ValueError("dynamic_repetitions must be positive")
+        if self.dynamic_max_cv < 0:
+            raise ValueError("dynamic_max_cv cannot be negative")
+        if self.dynamic_tolerance < 0:
+            raise ValueError("dynamic_tolerance cannot be negative")
+        if self.dynamic_timeout_sec <= 0:
+            raise ValueError("dynamic_timeout_sec must be positive")
+        self.validate_dynamic_policy()
+        required_gate_timeout = max(self.build_timeout_sec, self.test_timeout_sec)
+        if self.dynamic_mode != "off":
+            required_gate_timeout = (
+                self.build_timeout_sec
+                + self.test_timeout_sec
+                + self.dynamic_timeout_sec
+                + GATE_STATIC_ANALYSIS_MARGIN_SEC
             )
+        if self.gate_timeout_sec <= required_gate_timeout:
+            if self.dynamic_mode == "off":
+                raise ValueError(
+                    "gate_timeout_sec must exceed build_timeout_sec and "
+                    "test_timeout_sec"
+                )
+            raise ValueError(
+                "dynamic benchmarks require gate_timeout_sec to exceed "
+                "build_timeout_sec + test_timeout_sec + dynamic_timeout_sec "
+                f"+ {GATE_STATIC_ANALYSIS_MARGIN_SEC}s static-analysis margin"
+            )
+        import re
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.dynamic_ferretdb_url_env):
+            raise ValueError("dynamic_ferretdb_url_env must be an environment-variable name")
 
         if not self.orchestrator_model:
             self.orchestrator_model = (
@@ -303,8 +345,46 @@ class Config:
             require_model_price(self.api_provider, self.orchestrator_model)
             require_model_price(self.api_provider, self.agent_model)
 
+    def validate_dynamic_policy(self) -> None:
+        """Reject malformed dynamic weighting before it can affect a gate.
+
+        This is public because ``main.py`` applies CLI overrides after
+        dataclass construction.  Keeping the validation here makes direct
+        Config users and CLI users follow the same rule.
+        """
+        if not isinstance(self.dynamic_weights, dict):
+            raise ValueError("dynamic_weights must be a mapping")
+        for metric, raw_weight in self.dynamic_weights.items():
+            try:
+                weight = float(raw_weight)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"dynamic weight for {metric!r} must be a finite non-negative number"
+                ) from exc
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(
+                    f"dynamic weight for {metric!r} must be a finite non-negative number"
+                )
+
     def validate_for_run(self) -> None:
         """Reject unsafe/no-op validation before creating run state."""
+        # CLI overrides and programmatic callers can mutate a Config after
+        # dataclass construction, so repeat the dynamic policy/deadline
+        # checks at the point where a real run is authorised.
+        self.validate_dynamic_policy()
+        if self.dynamic_mode != "off":
+            required_gate_timeout = (
+                self.build_timeout_sec
+                + self.test_timeout_sec
+                + self.dynamic_timeout_sec
+                + GATE_STATIC_ANALYSIS_MARGIN_SEC
+            )
+            if self.gate_timeout_sec <= required_gate_timeout:
+                raise ValueError(
+                    "dynamic benchmarks require gate_timeout_sec to exceed "
+                    "build_timeout_sec + test_timeout_sec + dynamic_timeout_sec "
+                    f"+ {GATE_STATIC_ANALYSIS_MARGIN_SEC}s static-analysis margin"
+                )
         for label, command in (
             ("build_cmd", self.build_cmd),
             ("test_cmd", self.test_cmd),
@@ -352,8 +432,6 @@ class Config:
 
     @property
     def effective_api_key_env(self) -> str:
-        if self.api_provider == "subscription":
-            return ""
         if self.api_key_env:
             return self.api_key_env
         return (
@@ -424,6 +502,16 @@ class Config:
         return self.run_results_path / "baseline-bazel-output"
 
     @property
+    def dynamic_baseline_state_path(self) -> Path:
+        """Run-scoped pointer to the currently accepted dynamic measurement."""
+        return self.run_results_path / "dynamic_baseline.json"
+
+    @property
+    def dynamic_initial_baseline_artifact_path(self) -> Path:
+        """Artifacts collected once before the first programmer dispatch."""
+        return self.run_results_path / "benchmarks" / "initial_baseline"
+
+    @property
     def issue_history_dir(self) -> Path:
         """Run-scoped per-issue attempt records and pre-revert patches."""
         return self.run_results_path / "issues"
@@ -436,13 +524,7 @@ class Config:
             ",".join(self.agent_allowed_tools),
         ]
         if self.agent_bare_mode:
-            # --bare deliberately refuses OAuth/keychain credentials. Safe
-            # mode provides the same experiment isolation while retaining the
-            # Claude.ai subscription login.
-            args.insert(
-                0,
-                "--safe-mode" if self.api_provider == "subscription" else "--bare",
-            )
+            args.insert(0, "--bare")
         return args
 
     @property

@@ -14,7 +14,6 @@ from agents import PROMPT_DIR
 from agents.agent_runner import AgentProcess, spawn_claude_agent
 from agents.log_parser import (
     extract_assistant_text,
-    has_subscription_quota_error,
     has_successful_terminal_result,
 )
 from agents.provider import agent_subprocess_environment
@@ -114,23 +113,6 @@ class AnalystSession:
         returncode = self.process.process.wait()
         self.process.stdout_reader.join(timeout=5)
         if self.aborted:
-            return
-        quota_exhausted = bool(
-            self.cfg.api_provider == "subscription"
-            and self.log_path
-            and has_subscription_quota_error(self.log_path)
-        )
-        if quota_exhausted:
-            self.queue.put(mq.Message(
-                sender=self.analyst_id,
-                kind=mq.ANALYST_FINISHED,
-                payload={
-                    "analyst_id": self.analyst_id,
-                    "returncode": returncode,
-                    "review_completed": False,
-                    "subscription_quota_exhausted": True,
-                },
-            ))
             return
         issues = self._parse_issues_from_log()
         self.queue.put(mq.Message(

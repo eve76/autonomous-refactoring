@@ -11,9 +11,9 @@ synchronously at two decision points:
      gate, it decides whether to terminate or keep each agent, and may
      additionally mark specific issues as infeasible.
 
-Subscription mode uses one tool-free, schema-constrained Claude Code CLI turn.
-Explicit Anthropic/DeepSeek API modes retain the Messages API transport;
-DeepSeek forces schema-backed tool results.
+Implemented with the Anthropic Python SDK rather than a CLI subprocess,
+since the orchestrator needs no file editing or shell tools. DeepSeek calls
+use forced schema-backed tool results as the structured decision transport.
 """
 
 import json
@@ -22,13 +22,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from agents import PROMPT_DIR
-from agents.agent_runner import run_claude_once
-from agents.log_parser import is_subscription_quota_error
-from agents.provider import (
-    agent_subprocess_environment,
-    make_orchestrator_client,
-    validate_subscription_auth,
-)
+from agents.provider import make_orchestrator_client
 from config import Config
 from coordination.backlog import (
     Backlog, DONE, IN_PROGRESS, SKIPPED, TODO,
@@ -104,10 +98,6 @@ _STUCK_TOOL = {
 }
 
 
-class SubscriptionQuotaExhausted(RuntimeError):
-    """Claude Code reported that the shared subscription limit was reached."""
-
-
 def compact_backlog_view(backlog: Backlog, todo_limit: int) -> dict:
     """Return the deterministic assignment-only view sent to the LLM.
 
@@ -174,21 +164,7 @@ class StuckDecision:
 class Orchestrator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        if cfg.api_provider == "subscription":
-            self.client = None
-            self._subscription_auth_validated = False
-        else:
-            self.client = make_orchestrator_client(cfg)
-            self._subscription_auth_validated = True
-
-    def validate_transport(self) -> None:
-        """Validate subscription auth before experimental state is created."""
-        if self.cfg.api_provider != "subscription":
-            return
-        auth = validate_subscription_auth(self.cfg)
-        self.cfg.subscription_type = auth["subscription_type"]
-        self.cfg.claude_cli_version = auth["claude_cli_version"]
-        self._subscription_auth_validated = True
+        self.client = make_orchestrator_client(cfg)
 
     # -- decision point 1: task assignment ----------------------------
 
@@ -255,8 +231,6 @@ class Orchestrator:
     # -- transport -----------------------------------------------------
 
     def _call(self, user_msg: str, call_type: str = "unknown") -> str | dict:
-        if self.cfg.api_provider == "subscription":
-            return self._call_subscription(user_msg, call_type)
         kwargs = dict(
             model=self.cfg.orchestrator_model,
             max_tokens=4096,
@@ -323,110 +297,11 @@ class Orchestrator:
                 provider=self.cfg.api_provider,
                 model=self.cfg.orchestrator_model,
                 call_type=call_type,
-                source="orchestrator_cli",
             )
         except Exception as exc:
             # Accounting must never change an assignment decision.
             print(f"[orchestrator] failed to record token usage: {exc}")
         return structured_input if structured_input is not None else text
-
-    def _call_subscription(
-        self,
-        user_msg: str,
-        call_type: str,
-    ) -> str | dict:
-        if not getattr(self, "_subscription_auth_validated", False):
-            self.validate_transport()
-        schema = (
-            _ASSIGNMENT_TOOL["input_schema"]
-            if call_type == "assignment"
-            else _STUCK_TOOL["input_schema"]
-            if call_type == "stuck_evaluation"
-            else {"type": "object"}
-        )
-        result = run_claude_once(
-            cli_path=self.cfg.claude_cli,
-            cwd=PROMPT_DIR.parent,
-            system_prompt=(
-                "You are the deterministic decision component inside a "
-                "code-quality experiment. Follow the user prompt exactly and "
-                "return only an object matching the supplied JSON schema."
-            ),
-            task_prompt=user_msg,
-            model=self.cfg.orchestrator_model,
-            json_schema=schema,
-            extra_args=[
-                "--safe-mode",
-                "--no-session-persistence",
-                "--disable-slash-commands",
-            ],
-            env=agent_subprocess_environment(self.cfg),
-        )
-        structured_input = result.structured_output
-        if not isinstance(structured_input, Mapping) and result.result_text:
-            try:
-                candidate = json.loads(result.result_text)
-            except json.JSONDecodeError:
-                candidate = None
-            if isinstance(candidate, Mapping):
-                structured_input = dict(candidate)
-
-        raw_response = {
-            "returncode": result.returncode,
-            "events": result.events,
-            "stderr": result.stderr,
-        }
-        parsed_text = result.result_text
-        try:
-            append_orchestrator_raw_response(
-                self.cfg.run_results_path
-                / self.cfg.orchestrator_raw_responses_filename,
-                response=raw_response,
-                parsed_text=parsed_text,
-                structured_input=structured_input,
-                provider=self.cfg.api_provider,
-                model=self.cfg.orchestrator_model,
-                call_type=call_type,
-                source="orchestrator_cli",
-            )
-        except Exception as exc:
-            print(f"[orchestrator] failed to record raw response: {exc}")
-
-        terminal = result.terminal
-        try:
-            append_orchestrator_usage(
-                self.cfg.run_results_path
-                / self.cfg.orchestrator_usage_filename,
-                usage=terminal.get("usage"),
-                provider=self.cfg.api_provider,
-                model=self.cfg.orchestrator_model,
-                call_type=call_type,
-                reported_cost_usd=terminal.get("total_cost_usd"),
-                turns_or_calls=terminal.get("num_turns", 1),
-                model_usage=terminal.get("modelUsage"),
-                source="orchestrator_cli",
-            )
-        except Exception as exc:
-            print(f"[orchestrator] failed to record token usage: {exc}")
-
-        if is_subscription_quota_error({
-            "terminal": terminal,
-            "stderr": result.stderr,
-        }):
-            raise SubscriptionQuotaExhausted(
-                "Claude Code subscription usage limit reached; resume this "
-                "run after the subscription window resets"
-            )
-        if (
-            result.returncode != 0
-            or terminal.get("is_error") is True
-            or not isinstance(structured_input, Mapping)
-        ):
-            raise RuntimeError(
-                "Claude Code subscription orchestrator failed or omitted "
-                f"structured output (exit {result.returncode})"
-            )
-        return dict(structured_input)
 
     # -- parsing -------------------------------------------------------
 

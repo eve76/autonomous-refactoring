@@ -7,6 +7,16 @@ __pycache__/
 !.env.example
 live_smoke_results/
 production_runs/
+
+# Dynamic benchmark credentials and generated measurement artifacts.
+benchmarks/
+benchmark_artifacts/
+*.benchmark.json
+*.benchmark.log
+__pycache__/
+.venv/
+.cache/
 .claude/
+.env
 results/
 tmp/

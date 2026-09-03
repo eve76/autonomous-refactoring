@@ -125,8 +125,6 @@ _PRICES = {
 
 def canonical_model(provider: str, model: str) -> str:
     """Normalize provider aliases while retaining explicit model versions."""
-    if provider == "subscription":
-        provider = "anthropic"
     value = str(model or "").strip().lower()
     if provider == "deepseek" and value.endswith("[1m]"):
         value = value[:-4]
@@ -141,9 +139,7 @@ def canonical_model(provider: str, model: str) -> str:
 
 
 def get_model_price(provider: str, model: str) -> ModelPrice | None:
-    provider = str(provider).strip().lower()
-    pricing_provider = "anthropic" if provider == "subscription" else provider
-    key = (pricing_provider, canonical_model(pricing_provider, model))
+    key = (str(provider).strip().lower(), canonical_model(provider, model))
     return _PRICES.get(key)
 
 

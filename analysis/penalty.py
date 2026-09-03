@@ -13,6 +13,7 @@ doesn't see it.
 """
 
 import re
+import math
 from typing import Iterable
 
 DUP_K = 0.1
@@ -20,6 +21,9 @@ DUP_K = 0.1
 LIZARD_METRICS = ("ccn", "nloc", "param")
 PENALTY_METRICS = ("ccn", "cognitive", "nloc", "param", "duplicates")
 DEFAULT_WEIGHTS = {"ccn": 1, "nloc": 1, "cognitive": 1, "param": 1, "duplicates": 1}
+DYNAMIC_METRICS = (
+    "mongodb_real_time", "ferretdb_ns_per_op", "ferretdb_bytes_per_op",
+)
 
 
 def function_penalty(value: float, threshold: float) -> float:
@@ -34,6 +38,73 @@ def duplicate_penalty(ratio: float) -> float:
     if ratio <= 0.0:
         return 0.0
     return 100.0 * ratio / (ratio + DUP_K)
+
+
+def dynamic_regression_penalty(ratio: float, tolerance: float) -> float:
+    """Return a baseline-relative penalty for a measured regression.
+
+    There is intentionally no absolute latency/allocation threshold: the
+    candidate is compared only with its matched baseline.  Variation inside
+    ``1 + tolerance`` is zero; a larger ratio approaches 100.
+    """
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("dynamic metric ratio must be a finite positive number")
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("dynamic tolerance must be a finite non-negative number")
+    floor = 1.0 + tolerance
+    return 0.0 if ratio <= floor else 100.0 * (1.0 - floor / ratio)
+
+
+def compute_dynamic_penalty(
+    profile: str,
+    ratios: dict[str, list[float]],
+    *,
+    tolerance: float,
+    weights: dict[str, float] | None = None,
+) -> tuple[float, dict[str, dict[str, float]]]:
+    """Aggregate only the profile-approved baseline-relative ratios.
+
+    Each metric uses the mean per-case regression penalty, keeping a profile
+    with more benchmark cases from gaining a larger possible score merely due
+    to coverage. Missing approved metrics are an invalid comparison and are
+    reported to the caller as ``ValueError`` rather than treated as zero.
+    """
+    allowed = (
+        ("mongodb_real_time",) if profile == "mongodb-query" else
+        ("ferretdb_ns_per_op", "ferretdb_bytes_per_op") if profile == "ferretdb"
+        else ()
+    )
+    if not allowed:
+        raise ValueError(f"no approved dynamic metrics for profile {profile!r}")
+    weight_map = weights or {}
+    breakdown: dict[str, dict[str, float]] = {}
+    total = 0.0
+    for metric in allowed:
+        values = ratios.get(metric, [])
+        if not values:
+            raise ValueError(f"missing dynamic metric ratios for {metric}")
+        penalties = [dynamic_regression_penalty(float(value), tolerance) for value in values]
+        try:
+            weight = float(weight_map.get(metric, 1.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"dynamic weight for {metric!r} must be a finite non-negative number") from exc
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(f"dynamic weight for {metric!r} must be a finite non-negative number")
+        contribution = weight * (sum(penalties) / len(penalties))
+        breakdown[metric] = {
+            "weight": weight, "cases": float(len(values)),
+            "mean_ratio": sum(float(value) for value in values) / len(values),
+            "penalty": contribution,
+        }
+        total += contribution
+    return total, breakdown
+
+
+def compose_total_penalty(static_penalty: float, dynamic_penalty: float = 0.0) -> float:
+    """Compose a gate total without changing static ``compute_total_penalty``."""
+    if static_penalty < 0 or dynamic_penalty < 0:
+        raise ValueError("penalties cannot be negative")
+    return static_penalty + dynamic_penalty
 
 
 def compute_total_penalty(

@@ -41,15 +41,9 @@ def cfg(root: Path, **kwargs) -> Config:
 print("\n[1] provider defaults and validation")
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
-    subscription_cfg = cfg(root)
-    check("Claude subscription is the default provider",
-          subscription_cfg.api_provider == "subscription")
-    check("subscription mode stores no API credential variable",
-          subscription_cfg.effective_api_key_env == "")
-    check("subscription clean mode preserves OAuth instead of using --bare",
-          "--safe-mode" in subscription_cfg.agent_cli_extra_args
-          and "--bare" not in subscription_cfg.agent_cli_extra_args)
-    anthropic_cfg = cfg(root, api_provider="anthropic")
+    anthropic_cfg = cfg(root)
+    check("Anthropic remains the default provider",
+          anthropic_cfg.api_provider == "anthropic")
     check("Anthropic keeps the Opus defaults",
           anthropic_cfg.orchestrator_model == "claude-opus-4-7"
           and anthropic_cfg.agent_model == "claude-opus-4-7")
@@ -77,7 +71,6 @@ with tempfile.TemporaryDirectory() as td:
     try:
         cfg(
             root,
-            api_provider="anthropic",
             max_run_cost_usd=1.0,
             orchestrator_model="unknown-model",
         )
@@ -132,29 +125,6 @@ with tempfile.TemporaryDirectory() as td:
           child["CLAUDE_CODE_EFFORT_LEVEL"] == "max")
     check("Config stores the key name, never its value",
           "secret-test-value" not in repr(deepseek_cfg))
-
-    subscription_parent = {
-        "PATH": os.environ.get("PATH", ""),
-        "ANTHROPIC_API_KEY": "must-not-reach-child",
-        "ANTHROPIC_AUTH_TOKEN": "also-remove",
-        "ANTHROPIC_BASE_URL": "https://api.example.invalid",
-    }
-    subscription_child = provider.agent_subprocess_environment(
-        cfg(root), subscription_parent,
-    )
-    check("subscription children cannot inherit API billing variables",
-          all(name not in subscription_child for name in (
-              "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-              "ANTHROPIC_BASE_URL",
-          )))
-
-    try:
-        cfg(root, max_run_cost_usd=1.0)
-    except ValueError as exc:
-        check("subscription rejects misleading billed-cost ceilings",
-              "token ceilings" in str(exc))
-    else:
-        check("subscription rejects misleading billed-cost ceilings", False)
 
 
 print("\n[3] SDK client uses structured non-thinking DeepSeek requests")
@@ -248,52 +218,11 @@ with tempfile.TemporaryDirectory() as td:
           and usage_event["output_tokens"] == 12)
 
 
-print("\n[3b] subscription auth and orchestrator stay inside Claude Code")
-with tempfile.TemporaryDirectory() as td:
-    root = Path(td)
-    fake_cli = EXP / "tests" / "fake_claude_cli.py"
-    subscription_cfg = cfg(root, claude_cli=str(fake_cli))
-    auth = provider.validate_subscription_auth(subscription_cfg, {
-        "PATH": os.environ.get("PATH", ""),
-        "ANTHROPIC_API_KEY": "must-be-stripped",
-    })
-    check("preflight requires Claude.ai subscription metadata",
-          auth["auth_method"] == "claude.ai"
-          and auth["subscription_type"] == "max")
-    subscription_orchestrator = Orchestrator(subscription_cfg)
-    payload = subscription_orchestrator._call(
-        "You are the orchestrator. Return an empty assignment.", "assignment",
-    )
-    check("subscription orchestrator receives schema-constrained CLI output",
-          payload["programmer_assignments"] == []
-          and payload["analyst_assignments"] == [])
-    usage_path = (
-        subscription_cfg.run_results_path
-        / subscription_cfg.orchestrator_usage_filename
-    )
-    usage_event = json.loads(usage_path.read_text().strip())
-    check("subscription orchestrator usage is captured from Claude CLI",
-          usage_event["source"] == "orchestrator_cli"
-          and usage_event["input_tokens"] == 300
-          and usage_event["output_tokens"] == 30)
-
-
 print("\n[4] command-line provider selection and role-specific overrides")
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     old_argv = sys.argv
     try:
-        sys.argv = [
-            "main.py",
-            "--repo", str(root / "repo"),
-            "--work-root", str(root / "work"),
-            "--build-cmd", "echo build",
-            "--test-cmd", "echo test",
-        ]
-        parsed = parse_args()
-        check("CLI defaults every model role to subscription transport",
-              parsed.api_provider == "subscription")
-
         sys.argv = [
             "main.py",
             "--repo", str(root / "repo"),
@@ -352,7 +281,6 @@ with tempfile.TemporaryDirectory() as td:
 
         sys.argv = [
             "main.py", "--profile", "mongodb-query",
-            "--provider", "anthropic",
             "--max-run-cost-usd", "12.5",
         ]
         parsed = parse_args()
@@ -410,6 +338,24 @@ check("FerretDB validation generates version metadata first",
       commands[0][-2:] == ["generate", "./build/version"])
 check("FerretDB build validation remains repository-native",
       "-run=^$" in commands[1])
+check("FerretDB linked-worktree validation disables invalid parent VCS stamping",
+      "-buildvcs=false" in commands[1])
+old_goflags = os.environ.get("GOFLAGS")
+try:
+    os.environ["GOFLAGS"] = "-mod=readonly -buildvcs=true"
+    ferret_env = production_validation._command_environment("ferretdb")
+    check("nested FerretDB Go commands inherit disabled VCS stamping",
+          "-buildvcs=false" in ferret_env["GOFLAGS"]
+          and "-buildvcs=true" not in ferret_env["GOFLAGS"]
+          and "-mod=readonly" in ferret_env["GOFLAGS"])
+    check("MongoDB validation does not alter GOFLAGS",
+          production_validation._command_environment("mongodb-query")["GOFLAGS"]
+          == "-mod=readonly -buildvcs=true")
+finally:
+    if old_goflags is None:
+        os.environ.pop("GOFLAGS", None)
+    else:
+        os.environ["GOFLAGS"] = old_goflags
 mongo_test = production_validation._commands("mongodb-query", "test")
 check("MongoDB correctness gate excludes service tests and benchmarks",
       "--test_tag_filters=-mongo_integration_test,"

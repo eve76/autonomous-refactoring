@@ -7,7 +7,6 @@ streamed line-by-line to a per-agent log file for debugging.
 """
 
 import os
-import json
 import signal
 import subprocess
 import threading
@@ -48,84 +47,6 @@ class AgentProcess:
             self.log_file.close()
         except Exception:
             pass
-
-
-@dataclass
-class ClaudeCliRun:
-    """Completed synchronous Claude Code print-mode invocation."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-    events: list[dict]
-    terminal: dict
-
-    @property
-    def result_text(self) -> str:
-        value = self.terminal.get("result")
-        return value if isinstance(value, str) else ""
-
-    @property
-    def structured_output(self):
-        return self.terminal.get("structured_output")
-
-
-def run_claude_once(
-    *,
-    cli_path: str,
-    cwd: Path,
-    system_prompt: str,
-    task_prompt: str,
-    model: str,
-    json_schema: dict,
-    extra_args: Optional[list[str]] = None,
-    env: Optional[dict[str, str]] = None,
-    timeout_sec: int = 300,
-) -> ClaudeCliRun:
-    """Run one tool-free, schema-constrained Claude Code decision turn."""
-    cmd = [
-        cli_path,
-        "-p",
-        "--system-prompt", system_prompt,
-        "--tools", "",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--max-turns", "1",
-        "--json-schema", json.dumps(
-            json_schema, sort_keys=True, separators=(",", ":"),
-        ),
-        "--model", model,
-    ]
-    if extra_args:
-        cmd.extend(extra_args)
-    completed = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        input=task_prompt,
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=timeout_sec,
-    )
-    events = []
-    terminal = {}
-    for raw in completed.stdout.splitlines():
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        events.append(event)
-        if event.get("type") == "result":
-            terminal = event
-    return ClaudeCliRun(
-        returncode=completed.returncode,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-        events=events,
-        terminal=terminal,
-    )
 
 
 def spawn_claude_agent(

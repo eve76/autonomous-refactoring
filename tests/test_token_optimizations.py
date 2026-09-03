@@ -12,9 +12,7 @@ sys.path.insert(0, str(EXP))
 
 from agents.analyst import AnalystSession                              # noqa: E402
 from agents import analyst as analyst_module, programmer as programmer_module  # noqa: E402
-from agents.log_parser import (                                        # noqa: E402
-    has_subscription_quota_error, has_successful_terminal_result,
-)
+from agents.log_parser import has_successful_terminal_result           # noqa: E402
 from agents.orchestrator import Orchestrator, compact_backlog_view     # noqa: E402
 from analysis.candidates import build_local_leads, lead_matches_focus  # noqa: E402
 from config import Config                                               # noqa: E402
@@ -108,7 +106,6 @@ with tempfile.TemporaryDirectory() as td:
     cfg = Config(
         repo_root=root / "repo", target_subdir="src",
         work_root=root / "work", run_id="orchestrator_view",
-        api_provider="anthropic",
     )
     captured = {}
 
@@ -309,13 +306,6 @@ with tempfile.TemporaryDirectory() as td:
           has_successful_terminal_result(success_log)
           and not has_successful_terminal_result(truncated_log)
           and not has_successful_terminal_result(error_log))
-    quota_log = root / "quota.log"
-    quota_log.write_text(json.dumps({
-        "type": "result", "is_error": True,
-        "result": "Claude usage limit reached; resets in 2 hours",
-    }) + "\n")
-    check("subscription quota terminal errors are recognized",
-          has_subscription_quota_error(quota_log))
 
 
 print("\n[4] token ceilings close dispatch, wait for in-flight work, then stop")
@@ -357,7 +347,6 @@ with tempfile.TemporaryDirectory() as td:
     cfg = Config(
         repo_root=root / "repo", target_subdir="src",
         work_root=root / "work", run_id="cost-budget",
-        api_provider="anthropic",
         max_run_cost_usd=0.25,
     )
     coordinator = Coordinator(cfg, orchestrator=SimpleNamespace())
@@ -399,26 +388,6 @@ with tempfile.TemporaryDirectory() as td:
           and coordinator.budget_trigger == "cost_cny")
     check("RMB ceiling has a distinct terminal reason",
           coordinator.stop_reason == "cost_budget_cny")
-
-with tempfile.TemporaryDirectory() as td:
-    root = Path(td)
-    cfg = Config(
-        repo_root=root / "repo", target_subdir="src",
-        work_root=root / "work", run_id="subscription-quota",
-    )
-    coordinator = Coordinator(cfg, orchestrator=SimpleNamespace())
-    coordinator._apply_message(mq.Message(
-        sender="ANALYST_1", kind=mq.ANALYST_FINISHED,
-        payload={
-            "returncode": 1,
-            "review_completed": False,
-            "subscription_quota_exhausted": True,
-        },
-    ))
-    check("subscription exhaustion closes dispatch without counting a crash",
-          coordinator.subscription_quota_closed
-          and coordinator.agent_crashes == 0
-          and coordinator.stop_reason == "")
 
 
 print("\n[5] no-progress, resume and path-safety guards are bounded")

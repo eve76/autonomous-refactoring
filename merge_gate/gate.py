@@ -27,10 +27,15 @@ and "Integration") literally:
 """
 
 import subprocess
+import hashlib
+import time
+import uuid
+import fcntl
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from analysis.penalty import compute_total_penalty, DEFAULT_WEIGHTS
+from analysis.penalty import compute_total_penalty, compose_total_penalty, DEFAULT_WEIGHTS
 from analysis.tools import run_static_analysis, StaticAnalysisError
 from coordination import gate_attempts
 from coordination import issue_history
@@ -57,6 +62,16 @@ class GateResult:
     commit_hash: str = ""
     strategy: str = ""
     changed_files: list[str] = field(default_factory=list)
+    # Static fields above remain the coordinator's scalar source of truth.
+    # Dynamic data is explicit and safe to archive independently.
+    dynamic_mode: str = "off"
+    dynamic_available: bool = False
+    dynamic_comparable: bool = False
+    dynamic_penalty: float = 0.0
+    total_penalty_after: float = 0.0
+    dynamic_reason: str = ""
+    dynamic_artifact_dir: str = ""
+    dynamic_comparison: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +106,8 @@ class MergeGate:
         issue_history_dir: Path | None = None,
         build_timeout_sec: int = 60 * 60,
         test_timeout_sec: int = 60 * 60,
+        dynamic_config: dict | None = None,
+        dynamic_evaluator=None,
     ):
         self.worktree = worktree
         self.repo_root = repo_root
@@ -117,6 +134,9 @@ class MergeGate:
         self.issue_history_dir = issue_history_dir
         self.build_timeout_sec = build_timeout_sec
         self.test_timeout_sec = test_timeout_sec
+        self.dynamic_config = dict(dynamic_config or {"dynamic_mode": "off"})
+        self.dynamic_evaluator = dynamic_evaluator
+        self._dynamic_evaluation = None
         self._patch_metadata: dict = {}
         # None means "use the tools default"; an empty list means
         # "exclude nothing", so this must not collapse to `or`.
@@ -311,17 +331,52 @@ class MergeGate:
                 reason="tests failed - fix and re-run the gate",
             )
 
-        # Step 5: integration via fast-forward merge.
-        if not self._fast_forward_merge():
+        # Dynamic benchmarks are a distinct phase: normal build and
+        # correctness testing have already succeeded.  Off preserves the
+        # historical gate exactly; observe archives evidence only; enforce is
+        # fail-closed and includes the regression penalty in acceptance.
+        dynamic = self._evaluate_dynamic()
+        mode = str(self.dynamic_config.get("dynamic_mode", "off"))
+        dynamic["total_penalty_after"] = compose_total_penalty(
+            penalty_after, float(dynamic["dynamic_penalty"])
+        )
+        if mode == "enforce" and (not dynamic["dynamic_available"] or not dynamic["dynamic_comparable"]):
             return GateResult(
-                success=False,
-                penalty_before=penalty_before,
-                penalty_after=penalty_after,
-                tests_passed=True,
-                merged_race=True,
-                outcome=gate_attempts.FF_RACE,
-                reason="ff-merge lost race; will retry",
+                success=False, penalty_before=penalty_before, penalty_after=penalty_after,
+                tests_passed=True, outcome=gate_attempts.DYNAMIC_UNAVAILABLE,
+                reason="dynamic benchmark comparison unavailable - fix environment/data and re-run gate",
+                **dynamic,
             )
+        if mode == "enforce" and compose_total_penalty(penalty_after, dynamic["dynamic_penalty"]) >= penalty_before:
+            return GateResult(
+                success=False, penalty_before=penalty_before, penalty_after=penalty_after,
+                tests_passed=True, outcome=gate_attempts.DYNAMIC_REGRESSION,
+                reason="combined static and dynamic penalty did not decrease - performance regression rejected",
+                **dynamic,
+            )
+
+        # Step 5: integration via fast-forward merge.  The dynamic baseline
+        # pointer advances in the same critical section as the integration
+        # ref, so a concurrent loser retries against the winner's candidate
+        # measurement instead of re-running that new baseline.
+        with self._dynamic_merge_lock():
+            if (
+                not self._dynamic_baseline_still_current()
+                or not self._fast_forward_merge()
+            ):
+                return GateResult(
+                    success=False,
+                    penalty_before=penalty_before,
+                    penalty_after=penalty_after,
+                    tests_passed=True,
+                    merged_race=True,
+                    outcome=gate_attempts.FF_RACE,
+                    reason="ff-merge lost race; will retry",
+                    **dynamic,
+                )
+            promotion_error = self._promote_dynamic_candidate()
+            if promotion_error:
+                dynamic["dynamic_reason"] = promotion_error
 
         return GateResult(
             success=True,
@@ -330,6 +385,7 @@ class MergeGate:
             tests_passed=True,
             merged=True,
             outcome=gate_attempts.MERGED,
+            **dynamic,
         )
 
     # -- pipeline steps -----------------------------------------------
@@ -506,6 +562,113 @@ class MergeGate:
 
     def _test(self) -> CommandResult:
         return self._exec(self.test_cmd, self.test_timeout_sec)
+
+    def _evaluate_dynamic(self) -> dict:
+        mode = str(self.dynamic_config.get("dynamic_mode", "off"))
+        base = {
+            "dynamic_mode": mode, "dynamic_available": False,
+            "dynamic_comparable": False, "dynamic_penalty": 0.0,
+            "total_penalty_after": 0.0, "dynamic_reason": "",
+            "dynamic_artifact_dir": "", "dynamic_comparison": None,
+        }
+        if mode == "off":
+            self._dynamic_evaluation = None
+            return base
+        try:
+            evaluator = self.dynamic_evaluator
+            if evaluator is None:
+                from dynamic_metrics.runner import DynamicBenchmarkRunner
+                evaluator = DynamicBenchmarkRunner(self.dynamic_config)
+            artifact_raw = str(self.dynamic_config.get("dynamic_artifact_dir", ""))
+            if not artifact_raw:
+                raise ValueError("dynamic artifact directory is not configured")
+            artifact_dir = self._dynamic_attempt_artifact_dir(Path(artifact_raw))
+            evaluated = evaluator.evaluate(self.repo_root, self.worktree, artifact_dir)
+            self.dynamic_evaluator = evaluator
+            self._dynamic_evaluation = evaluated
+            base.update({
+                "dynamic_available": bool(evaluated.available),
+                "dynamic_comparable": bool(evaluated.comparable),
+                "dynamic_penalty": float(evaluated.dynamic_penalty),
+                "total_penalty_after": 0.0, # populated below by the gate result consumer
+                "dynamic_reason": str(evaluated.reason),
+                "dynamic_artifact_dir": str(evaluated.artifact_dir),
+                "dynamic_comparison": evaluated.comparison,
+            })
+        except Exception as exc:
+            # No URL is retained in config. Avoid surfacing unknown command
+            # output in this cross-process record.
+            base["dynamic_reason"] = f"dynamic evaluator failed: {type(exc).__name__}"
+        return base
+
+    @contextmanager
+    def _dynamic_merge_lock(self):
+        """Serialize integration-ref updates with rolling-baseline promotion."""
+        state_raw = str(
+            self.dynamic_config.get("dynamic_baseline_state_path", "")
+        )
+        if not state_raw:
+            yield
+            return
+        lock_path = Path(state_raw + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _promote_dynamic_candidate(self) -> str:
+        """Promote a measured accepted candidate; return an archival error."""
+        if str(self.dynamic_config.get("dynamic_mode", "off")) == "off":
+            return ""
+        evaluation = self._dynamic_evaluation
+        evaluator = self.dynamic_evaluator
+        if evaluation is None or evaluator is None:
+            return "dynamic candidate promotion unavailable"
+        promote = getattr(evaluator, "promote_candidate", None)
+        if promote is None:
+            # Injectable test evaluators and legacy callers need not implement
+            # persistence; production DynamicBenchmarkRunner always does.
+            return ""
+        try:
+            promote(evaluation)
+        except Exception as exc:
+            return f"dynamic candidate promotion failed: {type(exc).__name__}"
+        return ""
+
+    def _dynamic_baseline_still_current(self) -> bool:
+        """Reject a candidate measured before another concurrent merge."""
+        if not self.dynamic_config.get("dynamic_baseline_state_path"):
+            return True
+        evaluation = self._dynamic_evaluation
+        expected = str(getattr(evaluation, "baseline_commit", ""))
+        if not expected:
+            return True
+        result = subprocess.run(
+            ["git", "rev-parse", f"{self.integration_branch}^{{commit}}"],
+            cwd=str(self.repo_root), capture_output=True, text=True,
+        )
+        return result.returncode == 0 and result.stdout.strip() == expected
+
+    def _dynamic_attempt_artifact_dir(self, artifact_root: Path) -> Path:
+        """Allocate an attempt-specific artifact directory under ``artifact_root``.
+
+        A rejected dynamic result is evidence, and retries (including a
+        fast-forward race retry) must never replace it.  The issue label is
+        reduced to a safe path component and the timestamp/UUID pair prevents
+        collisions across gate processes started in the same nanosecond.
+        """
+        raw_issue = self.issue_id or "manual"
+        safe_issue = "".join(
+            char if char.isalnum() or char in "._-" else "_"
+            for char in raw_issue
+        ).strip(".") or "issue"
+        if safe_issue != raw_issue:
+            safe_issue = f"{safe_issue}-{hashlib.sha256(raw_issue.encode()).hexdigest()[:10]}"
+        attempt_id = f"attempt-{time.time_ns()}-{uuid.uuid4().hex[:12]}"
+        return artifact_root / safe_issue / attempt_id
 
     def _revert(self) -> None:
         """Reset the worktree to the pre-refactoring state.

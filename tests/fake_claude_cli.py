@@ -40,25 +40,6 @@ def emit(text: str, role: str = "unknown") -> None:
     }), flush=True)
 
 
-def emit_structured(payload: dict) -> None:
-    print(json.dumps({
-        "type": "result",
-        "result": json.dumps(payload, sort_keys=True),
-        "structured_output": payload,
-        "num_turns": 1,
-        "total_cost_usd": 0.005,
-        "usage": {"input_tokens": 300, "output_tokens": 30},
-        "modelUsage": {
-            "claude-opus-4-7": {
-                "inputTokens": 300,
-                "cacheCreationInputTokens": 0,
-                "cacheReadInputTokens": 0,
-                "outputTokens": 30,
-            },
-        },
-    }), flush=True)
-
-
 def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd, cwd=str(cwd), text=True, capture_output=True,
@@ -178,51 +159,22 @@ def programmer(task_prompt: str, cwd: Path) -> int:
 
 
 def main() -> int:
-    if sys.argv[1:3] == ["auth", "status"]:
-        print(json.dumps({
-            "loggedIn": True,
-            "authMethod": "claude.ai",
-            "apiProvider": "firstParty",
-            "subscriptionType": "max",
-        }))
-        return 0
-    if "--version" in sys.argv[1:]:
-        print("2.1.209 (Claude Code fake)")
-        return 0
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-p", action="store_true")
     parser.add_argument("--append-system-prompt", default="")
-    parser.add_argument("--system-prompt", default="")
     parser.add_argument("--permission-mode")
     parser.add_argument("--output-format")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--bare", action="store_true")
-    parser.add_argument("--safe-mode", action="store_true")
     parser.add_argument("--no-session-persistence", action="store_true")
     parser.add_argument("--allowedTools")
-    parser.add_argument("--tools")
-    parser.add_argument("--json-schema")
-    parser.add_argument("--max-turns")
-    parser.add_argument("--disable-slash-commands", action="store_true")
     args, _ = parser.parse_known_args()
     task_prompt = sys.stdin.read()
     if "code-quality analyst" in args.append_system_prompt:
         return analyst(task_prompt)
     if "programmer agent" in args.append_system_prompt:
         return programmer(task_prompt, Path.cwd())
-    if "deterministic decision component" in args.system_prompt:
-        if "STUCK PROGRAMMERS" in task_prompt:
-            emit_structured({
-                "terminate": [], "keep": [], "infeasible_issues": [],
-                "reasoning": "fake subscription orchestrator",
-            })
-        else:
-            emit_structured({
-                "programmer_assignments": [], "analyst_assignments": [],
-                "reasoning": "fake subscription orchestrator",
-            })
-        return 0
     emit("unsupported fake role", "unknown")
     return 2
 

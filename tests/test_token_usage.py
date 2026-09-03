@@ -251,30 +251,6 @@ with tempfile.TemporaryDirectory() as td:
           tu.budget_trigger(record, max_cost_cny=expected_cny) == "cost_cny")
 
 
-print("\n[7] subscription cost is API-equivalent, never incremental billing")
-with tempfile.TemporaryDirectory() as td:
-    log = Path(td) / "ANALYST_1_001.log"
-    log.write_text(json.dumps({
-        "type": "result",
-        "total_cost_usd": 99.0,
-        "usage": {"input_tokens": 1000, "output_tokens": 100},
-        "modelUsage": {
-            "claude-opus-4-7": {
-                "inputTokens": 1000,
-                "cacheReadInputTokens": 0,
-                "cacheCreationInputTokens": 0,
-                "outputTokens": 100,
-            },
-        },
-    }) + "\n")
-    record = tu._decorate_cost(tu.parse_agent_log(
-        log, provider="subscription", model="claude-opus-4-7",
-    ))
-    check("subscription ignores raw CLI cost as an actual charge",
-          record["effective_cost_usd"] != 99.0
-          and record["cost_source"] == "api_equivalent_estimate")
-
-
 print("\n" + "=" * 62)
 print(
     f"FAILURES ({len(FAILURES)}): " + "; ".join(FAILURES)

@@ -288,7 +288,6 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--bare", action="store_true")
-    parser.add_argument("--safe-mode", action="store_true")
     parser.add_argument("--no-session-persistence", action="store_true")
     parser.add_argument("--allowedTools")
     args, _ = parser.parse_known_args()

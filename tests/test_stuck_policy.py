@@ -129,9 +129,10 @@ with tempfile.TemporaryDirectory() as td:
 
     s = {"PROG_1": FakeSession(
         1900, ["ISSUE-0001"], gate_active=True,
-        gate_runtime=3 * 60 * 60 + 1,
+        gate_runtime=0,
     )}
     c, _ = make_coord(td, s, StuckDecision())
+    s["PROG_1"]._gate_runtime = c.cfg.gate_timeout_sec + 1
     c._check_stuck_agents()
     check("overall gate safety timeout still terminates",
           s["PROG_1"].killed is True)

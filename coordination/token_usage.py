@@ -165,28 +165,6 @@ def add_usage(left: dict, right: dict) -> dict:
     return total
 
 
-def _normalize_model_usage(raw_model_usage: Any) -> tuple[list[dict], dict]:
-    """Normalize Claude Code's modelUsage map and its aggregate."""
-    normalized_models = []
-    aggregate = empty_usage()
-    if not isinstance(raw_model_usage, Mapping):
-        return normalized_models, aggregate
-    for model_name, raw in raw_model_usage.items():
-        if not isinstance(raw, Mapping):
-            continue
-        normalized = normalize_usage({
-            "input_tokens": raw.get("inputTokens", 0),
-            "cache_creation_input_tokens": raw.get(
-                "cacheCreationInputTokens", 0
-            ),
-            "cache_read_input_tokens": raw.get("cacheReadInputTokens", 0),
-            "output_tokens": raw.get("outputTokens", 0),
-        })
-        normalized_models.append({"model": str(model_name), **normalized})
-        aggregate = add_usage(aggregate, normalized)
-    return normalized_models, aggregate
-
-
 def estimate_cost_usd(usage: dict, *, provider: str, model: str) -> float | None:
     """Estimate one usage record from the pinned official price snapshot."""
     price = get_model_price(provider, model)
@@ -290,11 +268,7 @@ def _decorate_cost(record: dict) -> dict:
         value["cost_source"] = "provider_reported"
     elif estimated is not None:
         value["effective_cost_usd"] = estimated
-        value["cost_source"] = (
-            "api_equivalent_estimate"
-            if provider == "subscription"
-            else "pinned_price_estimate"
-        )
+        value["cost_source"] = "pinned_price_estimate"
     elif has_reported:
         value["effective_cost_usd"] = round(
             float(value.get("reported_cost_usd", 0.0)), 8,
@@ -313,43 +287,19 @@ def append_orchestrator_usage(
     provider: str,
     model: str,
     call_type: str,
-    reported_cost_usd: Any = None,
-    turns_or_calls: int = 1,
-    model_usage: Any = None,
-    source: str = "orchestrator_api",
 ) -> None:
-    """Append one completed synchronous orchestrator turn atomically."""
-    normalized_models, aggregate = _normalize_model_usage(model_usage)
-    normalized = (
-        aggregate if normalized_models
-        else normalize_usage(
-            usage,
-            turns_or_calls=turns_or_calls,
-            reported_cost_usd=reported_cost_usd,
-        )
-    )
-    if normalized_models:
-        normalized["turns_or_calls"] = _nonnegative_int(turns_or_calls) or 1
-        try:
-            normalized["reported_cost_usd"] = round(
-                max(0.0, float(reported_cost_usd)), 8,
-            )
-            normalized["records_with_reported_cost"] = 1
-        except (TypeError, ValueError):
-            pass
+    """Append one completed synchronous SDK request as one atomic JSONL line."""
     record = {
         "timestamp": round(time.time(), 3),
-        "source": source,
+        "source": "orchestrator_api",
         "role": "orchestrator",
         "agent": "ORCHESTRATOR",
         "dispatch": call_type,
         "provider": provider,
         "model": model,
         "usage_available": bool(_mapping(usage)),
-        **normalized,
+        **normalize_usage(usage, turns_or_calls=1),
     }
-    if normalized_models:
-        record["model_usage"] = normalized_models
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, sort_keys=True) + "\n"
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -368,7 +318,6 @@ def append_orchestrator_raw_response(
     provider: str,
     model: str,
     call_type: str,
-    source: str = "orchestrator_api",
 ) -> None:
     """Append the complete SDK response used by the orchestrator parser.
 
@@ -388,7 +337,7 @@ def append_orchestrator_raw_response(
         payload = response
     record = {
         "timestamp": round(time.time(), 3),
-        "source": source,
+        "source": "orchestrator_api",
         "role": "orchestrator",
         "agent": "ORCHESTRATOR",
         "dispatch": call_type,
@@ -476,9 +425,25 @@ def parse_agent_log(path: Path, *, provider: str, model: str) -> dict:
     if result_usage is not None:
         normalized_models = []
         if result_model_usage:
-            normalized_models, usage = _normalize_model_usage(
-                result_model_usage
-            )
+            usage = empty_usage()
+            for model_name, raw in result_model_usage.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                normalized = normalize_usage({
+                    "input_tokens": raw.get("inputTokens", 0),
+                    "cache_creation_input_tokens": raw.get(
+                        "cacheCreationInputTokens", 0
+                    ),
+                    "cache_read_input_tokens": raw.get(
+                        "cacheReadInputTokens", 0
+                    ),
+                    "output_tokens": raw.get("outputTokens", 0),
+                })
+                normalized_models.append({
+                    "model": str(model_name),
+                    **normalized,
+                })
+                usage = add_usage(usage, normalized)
             usage["turns_or_calls"] = _nonnegative_int(result_turns) or 1
             usage["sessions"] = 1
             try:
@@ -571,11 +536,6 @@ def collect_token_usage(
 
     return {
         "provider": provider,
-        "billing_mode": (
-            "claude_subscription"
-            if provider == "subscription"
-            else "metered_api"
-        ),
         "totals": totals,
         "by_role": _by(records, "role"),
         "by_agent": _by(records, "agent"),
@@ -608,14 +568,12 @@ def collect_token_usage(
                 "comparison but not guaranteed to equal HTTP request count"
             ),
             "reported_cost_usd": (
-                "raw CLI field; it is not an incremental charge in Claude "
-                "subscription mode; historical DeepSeek logs use a misleading "
-                "*_usd key for a CNY value"
+                "raw CLI field; accurate USD for Anthropic, but historical "
+                "DeepSeek logs use a misleading *_usd key for a CNY value"
             ),
             "effective_cost_usd": (
-                "Anthropic API mode uses reported CLI cost plus estimates; "
-                "DeepSeek uses pinned estimates; subscription mode reports "
-                "an API-equivalent estimate, not actual incremental billing"
+                "Anthropic reported CLI cost plus pinned-price estimates for "
+                "SDK calls; DeepSeek always uses pinned official estimates"
             ),
             "effective_cost_cny": (
                 "DeepSeek only: pinned official RMB estimate used by the "

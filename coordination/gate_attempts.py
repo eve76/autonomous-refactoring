@@ -56,6 +56,8 @@ ANALYSIS_FAILED = "analysis_failed"
 OUT_OF_SCOPE = "out_of_scope"
 ATTEMPT_LIMIT = "attempt_limit"
 DUPLICATE_PATCH = "duplicate_patch"
+DYNAMIC_UNAVAILABLE = "dynamic_unavailable"
+DYNAMIC_REGRESSION = "dynamic_regression"
 
 OUTCOMES = (
     MERGED,
@@ -74,6 +76,8 @@ OUTCOMES = (
     OUT_OF_SCOPE,
     ATTEMPT_LIMIT,
     DUPLICATE_PATCH,
+    DYNAMIC_UNAVAILABLE,
+    DYNAMIC_REGRESSION,
 )
 
 
@@ -112,6 +116,20 @@ def make_record(agent_id: str, result, issue_id: str = "") -> dict:
         value = getattr(result, key, None)
         if value not in (None, "", []):
             record[key] = value
+    dynamic = {
+        "mode": getattr(result, "dynamic_mode", "off"),
+        "available": bool(getattr(result, "dynamic_available", False)),
+        "comparable": bool(getattr(result, "dynamic_comparable", False)),
+        "penalty": round(float(getattr(result, "dynamic_penalty", 0.0)), 4),
+        "total_penalty_after": round(float(getattr(result, "total_penalty_after", 0.0)), 4),
+        "reason": getattr(result, "dynamic_reason", ""),
+        "artifact_dir": getattr(result, "dynamic_artifact_dir", ""),
+    }
+    comparison = getattr(result, "dynamic_comparison", None)
+    if comparison is not None:
+        dynamic["comparison"] = comparison
+    if dynamic["mode"] != "off" or dynamic["reason"]:
+        record["dynamic"] = dynamic
     return record
 
 
@@ -170,5 +188,7 @@ def summarize(records: list[dict]) -> dict:
         "scope_violations": by_outcome[OUT_OF_SCOPE],
         "attempt_limit_rejections": by_outcome[ATTEMPT_LIMIT],
         "duplicate_patch_rejections": by_outcome[DUPLICATE_PATCH],
+        "dynamic_unavailable": by_outcome[DYNAMIC_UNAVAILABLE],
+        "dynamic_regressions": by_outcome[DYNAMIC_REGRESSION],
         "by_outcome": by_outcome,
     }

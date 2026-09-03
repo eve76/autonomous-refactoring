@@ -23,6 +23,9 @@ SUITES = [
     ("provider-neutral token usage accounting", "test_token_usage.py"),
     ("Go cognitive complexity via gocognit", "test_go_cognitive.py"),
     ("conservative token-saving stages 2 and 3", "test_token_optimizations.py"),
+    ("MongoDB offline dynamic benchmark metrics", "test_mongodb_dynamic_metrics.py"),
+    ("FerretDB offline dynamic benchmark metrics", "test_ferretdb_dynamic_metrics.py"),
+    ("dynamic gate modes and safe benchmark artifacts", "test_dynamic_gate.py"),
 ]
 
 

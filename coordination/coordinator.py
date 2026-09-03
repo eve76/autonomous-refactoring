@@ -52,9 +52,7 @@ from coordination.token_usage import (
     collect_token_usage,
 )
 from coordination.model_pricing import pricing_snapshot
-from agents.orchestrator import (
-    Orchestrator, AssignmentDecision, SubscriptionQuotaExhausted,
-)
+from agents.orchestrator import Orchestrator, AssignmentDecision
 from agents.analyst import AnalystSession
 from agents.programmer import ProgrammerSession
 from analysis.candidates import (
@@ -114,9 +112,6 @@ class Coordinator:
         self.budget_dispatch_closed: bool = False
         self.budget_trigger: str = ""
         self.budget_usage_at_close: dict = {}
-        # A subscription limit closes dispatch immediately but, like token
-        # ceilings, lets already-running workers finish before shutdown.
-        self.subscription_quota_closed: bool = False
 
         self.orchestrator = orchestrator if orchestrator is not None else Orchestrator(cfg)
         self.empty_analyst_scans: int = 0
@@ -153,8 +148,6 @@ class Coordinator:
 
     def run(self) -> None:
         self.cfg.validate_for_run()
-        if isinstance(self.orchestrator, Orchestrator):
-            self.orchestrator.validate_transport()
         try:
             self._initialize()
             self._main_loop()
@@ -175,6 +168,7 @@ class Coordinator:
                     self.cfg.run_results_path / self.cfg.orchestrator_usage_filename,
                     self.cfg.run_results_path / self.cfg.orchestrator_raw_responses_filename,
                     self.cfg.run_results_path / self.cfg.token_usage_filename,
+                    self.cfg.dynamic_baseline_state_path,
                 )
                 if path.exists()
             ]
@@ -400,9 +394,50 @@ class Coordinator:
         # it on the immutable baseline before any paid model dispatch, and
         # fail fast if the repository cannot build in this environment.
         self._prewarm_baseline_build(restored)
+        self._initialize_dynamic_baseline()
 
         self.programmer_pool = ThreadPoolExecutor(max_workers=self.cfg.num_programmers)
         self.analyst_pool = ThreadPoolExecutor(max_workers=self.cfg.num_analysts)
+
+    def _initialize_dynamic_baseline(self) -> None:
+        """Collect the run's first rolling dynamic baseline before dispatch."""
+        if self.cfg.dynamic_mode == "off":
+            return
+        from dynamic_metrics.runner import DynamicBenchmarkRunner
+
+        dynamic_config = {
+            "dynamic_mode": self.cfg.dynamic_mode,
+            "dynamic_repetitions": self.cfg.dynamic_repetitions,
+            "dynamic_max_cv": self.cfg.dynamic_max_cv,
+            "dynamic_tolerance": self.cfg.dynamic_tolerance,
+            "dynamic_weights": self.cfg.dynamic_weights,
+            "dynamic_ferretdb_url_env": self.cfg.dynamic_ferretdb_url_env,
+            "dynamic_bazel_binary": self.cfg.dynamic_bazel_binary,
+            "dynamic_timeout_sec": self.cfg.dynamic_timeout_sec,
+            "production_profile": self.cfg.production_profile,
+            "dynamic_baseline_state_path": str(
+                self.cfg.dynamic_baseline_state_path
+            ),
+        }
+        result = DynamicBenchmarkRunner(dynamic_config).initialize_baseline(
+            self.cfg.repo_root,
+            self.cfg.dynamic_initial_baseline_artifact_path,
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=str(self.cfg.repo_root),
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(),
+        )
+        if not result.available:
+            message = f"dynamic baseline unavailable: {result.reason}"
+            if self.cfg.dynamic_mode == "enforce":
+                raise RuntimeError(message)
+            print(f"[coordinator] warning: {message}")
+            return
+        action = "reused" if result.reused else "measured"
+        print(
+            f"[coordinator] dynamic baseline {action} for "
+            f"{result.commit[:10]} with {self.cfg.dynamic_repetitions} repetitions"
+        )
 
     def _measure(self) -> tuple[float, dict, dict]:
         """Measure total penalty, per-metric penalty split, and the metric
@@ -710,6 +745,24 @@ class Coordinator:
         reduction = self.baseline_penalty - self.current_penalty
         pct = (reduction / self.baseline_penalty * 100.0) if self.baseline_penalty else 0.0
         merges = self.history.merge_count()
+        dynamic_attempts = []
+        for record in gate_attempts.load(
+            self.cfg.run_results_path / self.cfg.gate_attempts_filename
+        ):
+            dynamic = record.get("dynamic")
+            if isinstance(dynamic, dict):
+                # The gate record stores only the env-var name/configured
+                # artifact path; keep the run summary similarly non-secret.
+                dynamic_attempts.append({
+                    "issue_id": record.get("issue_id", ""),
+                    "outcome": record.get("outcome", ""),
+                    "mode": dynamic.get("mode", "off"),
+                    "available": bool(dynamic.get("available", False)),
+                    "comparable": bool(dynamic.get("comparable", False)),
+                    "penalty": dynamic.get("penalty", 0.0),
+                    "artifact_dir": dynamic.get("artifact_dir", ""),
+                    "reason": dynamic.get("reason", ""),
+                })
         token_summary = build_token_artifacts(
             agent_log_dir=self.cfg.agent_log_dir,
             orchestrator_log=(
@@ -762,6 +815,16 @@ class Coordinator:
             "total_reduction": round(reduction, 4),
             "reduction_pct": round(pct, 2),
             "merges": merges,
+            "dynamic_benchmarks": {
+                "mode": self.cfg.dynamic_mode,
+                "repetitions": self.cfg.dynamic_repetitions,
+                "aggregation": "arithmetic_mean",
+                "attempts": dynamic_attempts,
+                "artifact_root": str(self.cfg.run_results_path / "benchmarks"),
+                "rolling_baseline_state": str(
+                    self.cfg.dynamic_baseline_state_path
+                ),
+            },
             "stagnation_counter": self.stagnation.counter,
             "baseline_build": {
                 "enabled": self.cfg.prewarm_build_cache,
@@ -894,13 +957,19 @@ class Coordinator:
                     self.cfg.effective_api_base_url
                 ),
                 "api_key_env": self.cfg.effective_api_key_env,
-                "subscription_type": self.cfg.subscription_type or None,
-                "claude_cli_version": self.cfg.claude_cli_version or None,
                 "orchestrator_model": self.cfg.orchestrator_model,
                 "agent_model": self.cfg.agent_model,
                 "deepseek_effort": self.cfg.deepseek_effort,
                 "thresholds": self.cfg.thresholds,
                 "weights": self.cfg.weights,
+                "dynamic_mode": self.cfg.dynamic_mode,
+                "dynamic_repetitions": self.cfg.dynamic_repetitions,
+                "dynamic_max_cv": self.cfg.dynamic_max_cv,
+                "dynamic_tolerance": self.cfg.dynamic_tolerance,
+                "dynamic_weights": self.cfg.dynamic_weights,
+                "dynamic_timeout_sec": self.cfg.dynamic_timeout_sec,
+                # This is a name only; never add the environment value.
+                "dynamic_ferretdb_url_env": self.cfg.dynamic_ferretdb_url_env,
                 "min_merge_gain": self.cfg.min_merge_gain,
                 "stagnation_limit": self.cfg.stagnation_limit,
                 "programmer_timeout_sec": self.cfg.programmer_timeout_sec,
@@ -967,8 +1036,7 @@ class Coordinator:
             f"cache-read={token_totals['cache_read_input_tokens']}), "
             f"output={token_totals['output_tokens']}, "
             f"total={token_totals['total_tokens']}; "
-            f"{'API-equivalent' if self.cfg.api_provider == 'subscription' else 'effective'} "
-            f"cost=${token_totals['effective_cost_usd']:.6f}; "
+            f"effective cost=${token_totals['effective_cost_usd']:.6f}; "
             f"DeepSeek cost=¥{token_totals['effective_cost_cny']:.6f}; "
             f"usage coverage={token_coverage['records_with_usage']}/"
             f"{token_coverage['records']}\n"
@@ -991,21 +1059,12 @@ class Coordinator:
             budget_closed = self._check_token_budget()
             if self.stop_reason:
                 break
-            if (
-                self.subscription_quota_closed
-                and not self.programmer_futures
-                and not self.analyst_futures
-                and self.queue.empty()
-            ):
-                self.stop_reason = "subscription_quota_exhausted"
-                break
             self._check_no_actionable_stop()
             if self.stop_reason:
                 break
-            if not budget_closed and not self.subscription_quota_closed:
+            if not budget_closed:
                 self._dispatch_if_needed()
-            if not self.subscription_quota_closed:
-                self._check_stuck_agents()
+            self._check_stuck_agents()
             time.sleep(self.cfg.backlog_drain_interval_sec)
 
     def _drain_queue(self) -> None:
@@ -1070,21 +1129,9 @@ class Coordinator:
             return
 
         if msg.kind in (mq.PROGRAMMER_FINISHED, mq.ANALYST_FINISHED):
-            if bool(msg.payload.get("subscription_quota_exhausted")):
-                # Leave unresolved programmer work retryable and preserve all
-                # run state. `--resume` can continue after the shared Claude
-                # subscription window resets.
-                self.subscription_quota_closed = True
-                print(
-                    f"[coordinator] {msg.sender} reached the Claude Code "
-                    "subscription limit; stopping safely for later --resume"
-                )
             # Sessions the coordination layer killed never post these, so
             # a non-zero code here means the CLI itself died.
-            if (
-                int(msg.payload.get("returncode", 0)) != 0
-                and not bool(msg.payload.get("subscription_quota_exhausted"))
-            ):
+            if int(msg.payload.get("returncode", 0)) != 0:
                 self.agent_crashes += 1
                 print(
                     f"[coordinator] {msg.sender} exited "
@@ -1222,7 +1269,7 @@ class Coordinator:
         payload = {
             # Schema 6 also binds production validation and pricing. Refuse cross-version
             # resume rather than silently changing build/test or tool scope.
-            "schema": 7,
+            "schema": 9,
             "repo_root": str(self.cfg.repo_root.resolve()),
             "production_profile": self.cfg.production_profile,
             "target_subdir": self.cfg.target_subdir,
@@ -1244,6 +1291,14 @@ class Coordinator:
             ),
             "thresholds": self.cfg.thresholds,
             "weights": self.cfg.weights,
+            "dynamic_mode": self.cfg.dynamic_mode,
+            "dynamic_repetitions": self.cfg.dynamic_repetitions,
+            "dynamic_max_cv": self.cfg.dynamic_max_cv,
+            "dynamic_tolerance": self.cfg.dynamic_tolerance,
+            "dynamic_weights": self.cfg.dynamic_weights,
+            "dynamic_timeout_sec": self.cfg.dynamic_timeout_sec,
+            "dynamic_ferretdb_url_env": self.cfg.dynamic_ferretdb_url_env,
+            "dynamic_bazel_binary": self.cfg.dynamic_bazel_binary,
             "exclude_dirs": list(self.cfg.exclude_dirs),
             "orchestrator_backlog_top_k": (
                 self.cfg.orchestrator_backlog_top_k
@@ -1254,8 +1309,6 @@ class Coordinator:
             "max_run_cost_usd": self.cfg.max_run_cost_usd,
             "max_run_cost_cny": self.cfg.max_run_cost_cny,
             "api_provider": self.cfg.api_provider,
-            "subscription_type": self.cfg.subscription_type,
-            "claude_cli_version": self.cfg.claude_cli_version,
             "orchestrator_model": self.cfg.orchestrator_model,
             "agent_model": self.cfg.agent_model,
             "pricing_snapshot": pricing_snapshot(),
@@ -1436,6 +1489,7 @@ class Coordinator:
             gate_reduction=round(gate_reduction, 4),
             stagnation_counter=self.stagnation.counter,
             breakdown=breakdown,
+            dynamic=self._gate_dynamic_record(msg.sender, issue_id, before, after),
         )
         self._save_state()
         print(
@@ -1470,6 +1524,22 @@ class Coordinator:
                 return False
             return same_before and same_after
         return False
+
+    def _gate_dynamic_record(self, agent: str, issue_id: str, before: float, after: float) -> dict | None:
+        """Return the safe dynamic attachment for a verified merge record."""
+        for record in reversed(gate_attempts.load(
+            self.cfg.run_results_path / self.cfg.gate_attempts_filename
+        )):
+            if (record.get("agent"), record.get("issue_id"), record.get("outcome")) != (agent, issue_id, gate_attempts.MERGED):
+                continue
+            try:
+                if abs(float(record["penalty_before"]) - before) > 0.05 or abs(float(record["penalty_after"]) - after) > 0.05:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            dynamic = record.get("dynamic")
+            return dynamic if isinstance(dynamic, dict) else None
+        return None
 
     def _reap_finished_futures(self) -> None:
         for name in list(self.programmer_futures):
@@ -1550,20 +1620,15 @@ class Coordinator:
         if not self._has_actionable_work(snapshot, idle_programmers, idle_analysts):
             return
 
-        try:
-            decision = self.orchestrator.assign(
-                current_penalty=self.current_penalty,
-                baseline_penalty=self.baseline_penalty,
-                backlog=snapshot,
-                idle_programmers=idle_programmers,
-                idle_analysts=idle_analysts,
-                stagnation=self.stagnation.counter,
-                metric_breakdown=self.metric_breakdown,
-            )
-        except SubscriptionQuotaExhausted as exc:
-            self.subscription_quota_closed = True
-            print(f"[coordinator] {exc}")
-            return
+        decision = self.orchestrator.assign(
+            current_penalty=self.current_penalty,
+            baseline_penalty=self.baseline_penalty,
+            backlog=snapshot,
+            idle_programmers=idle_programmers,
+            idle_analysts=idle_analysts,
+            stagnation=self.stagnation.counter,
+            metric_breakdown=self.metric_breakdown,
+        )
         # The synchronous orchestrator call itself may cross a ceiling.
         if self._check_token_budget():
             return
@@ -1866,10 +1931,6 @@ class Coordinator:
                 stagnation=self.stagnation.counter,
                 hard_timeout_sec=self.cfg.programmer_timeout_sec,
             )
-        except SubscriptionQuotaExhausted as exc:
-            self.subscription_quota_closed = True
-            print(f"[coordinator] {exc}")
-            return
         except Exception as exc:
             print(f"[coordinator] stuck-agent evaluation failed: {exc}")
             return

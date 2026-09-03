@@ -70,7 +70,9 @@ def get_production_profile(name: str) -> ProductionProfile:
             prewarm_build_cache=False,
             build_timeout_sec=45 * 60,
             test_timeout_sec=45 * 60,
-            gate_timeout_sec=2 * 60 * 60,
+            # 45m build + 45m correctness + 60m dynamic benchmark +
+            # Config's five-minute static-analysis margin.
+            gate_timeout_sec=3 * 60 * 60,
             lizard_binary=project_tool("lizard"),
             gocognit_binary=project_tool("gocognit"),
             duplo_binary="",
@@ -106,7 +108,8 @@ def get_production_profile(name: str) -> ProductionProfile:
         prewarm_build_cache=True,
         build_timeout_sec=2 * 60 * 60,
         test_timeout_sec=4 * 60 * 60,
-        gate_timeout_sec=7 * 60 * 60,
+        # 2h build + 4h correctness + 60m dynamic benchmark + static margin.
+        gate_timeout_sec=7 * 60 * 60 + 15 * 60,
         lizard_binary=project_tool("lizard"),
         gocognit_binary=project_tool("gocognit"),
         duplo_binary=str((PROJECT_ROOT / "bin" / "duplo").resolve()),

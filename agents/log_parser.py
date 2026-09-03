@@ -10,50 +10,6 @@ import json
 from pathlib import Path
 
 
-_SUBSCRIPTION_QUOTA_MARKERS = (
-    "usage limit reached",
-    "usage limit",
-    "hit your limit",
-    "you've hit your limit",
-    "you have hit your limit",
-    "rate limit reached",
-    "resets at",
-    "resets in",
-)
-
-
-def is_subscription_quota_error(value) -> bool:
-    """Recognize Claude Code's terminal subscription-limit diagnostics."""
-    try:
-        text = json.dumps(value, sort_keys=True, default=str).lower()
-    except (TypeError, ValueError):
-        text = str(value).lower()
-    return any(marker in text for marker in _SUBSCRIPTION_QUOTA_MARKERS)
-
-
-def has_subscription_quota_error(log_path: Path) -> bool:
-    if not log_path.exists():
-        return False
-    terminal = None
-    raw_parts = []
-    with log_path.open(errors="replace") as fh:
-        for raw in fh:
-            raw_parts.append(raw)
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") == "result":
-                terminal = obj
-    if (
-        terminal is not None
-        and terminal.get("is_error") is True
-        and is_subscription_quota_error(terminal)
-    ):
-        return True
-    return terminal is None and is_subscription_quota_error("".join(raw_parts))
-
-
 def has_successful_terminal_result(log_path: Path) -> bool:
     """Return whether a stream-json log ended in a successful result event.
 

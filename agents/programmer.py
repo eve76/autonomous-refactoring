@@ -16,10 +16,7 @@ from typing import Optional
 from config import Config
 from agents import GATE_CLI, PROMPT_DIR
 from agents.agent_runner import AgentProcess, spawn_claude_agent
-from agents.log_parser import (
-    extract_assistant_text,
-    has_subscription_quota_error,
-)
+from agents.log_parser import extract_assistant_text
 from agents.provider import agent_subprocess_environment
 from coordination import gate_attempts
 from coordination import message_queue as mq
@@ -181,6 +178,24 @@ class ProgrammerSession:
             "gate_python": sys.executable,
             "gate_cli": str(GATE_CLI),
             "gate_status_file": str(self._gate_status_path()),
+            "dynamic_config": {
+                "dynamic_mode": self.cfg.dynamic_mode,
+                "dynamic_repetitions": self.cfg.dynamic_repetitions,
+                "dynamic_max_cv": self.cfg.dynamic_max_cv,
+                "dynamic_tolerance": self.cfg.dynamic_tolerance,
+                "dynamic_weights": self.cfg.dynamic_weights,
+                "dynamic_ferretdb_url_env": self.cfg.dynamic_ferretdb_url_env,
+                "dynamic_bazel_binary": self.cfg.dynamic_bazel_binary,
+                "dynamic_timeout_sec": self.cfg.dynamic_timeout_sec,
+                "production_profile": self.cfg.production_profile,
+                # Config carries an environment-variable name, never its value.
+                "dynamic_artifact_dir": str(
+                    self.cfg.run_results_path / "benchmarks" / self.programmer_id
+                ),
+                "dynamic_baseline_state_path": str(
+                    self.cfg.dynamic_baseline_state_path
+                ),
+            },
         }
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(cfg_payload, indent=2))
@@ -244,22 +259,6 @@ class ProgrammerSession:
         returncode = self.process.process.wait()
         self.process.stdout_reader.join(timeout=5)
         if self.aborted:
-            return
-        quota_exhausted = bool(
-            self.cfg.api_provider == "subscription"
-            and self.log_path
-            and has_subscription_quota_error(self.log_path)
-        )
-        if quota_exhausted:
-            self.queue.put(mq.Message(
-                sender=self.programmer_id,
-                kind=mq.PROGRAMMER_FINISHED,
-                payload={
-                    "programmer_id": self.programmer_id,
-                    "returncode": returncode,
-                    "subscription_quota_exhausted": True,
-                },
-            ))
             return
         results = self._parse_results_from_log()
         recovered = self._recover_merged_gate_results({

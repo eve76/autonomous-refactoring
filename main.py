@@ -10,7 +10,6 @@ from pathlib import Path
 
 from analysis.penalty import PENALTY_METRICS
 from config import Config, SUPPORTED_API_PROVIDERS
-from coordination.coordinator import Coordinator
 from production_profiles import (
     PROFILE_NAMES,
     get_production_profile,
@@ -186,15 +185,12 @@ def parse_args() -> Config:
         help="Test command run inside each worktree, e.g. 'ctest --output-on-failure'",
     )
     p.add_argument(
-        "--provider", choices=SUPPORTED_API_PROVIDERS, default="subscription",
-        help=(
-            "model transport: subscription uses the logged-in Claude Code "
-            "Pro/Max allocation for every role; anthropic/deepseek use APIs"
-        ),
+        "--provider", choices=SUPPORTED_API_PROVIDERS, default="anthropic",
+        help="LLM API provider for the orchestrator and CLI agents",
     )
     p.add_argument(
         "--api-base-url", default="",
-        help="Override an API provider's Anthropic-compatible base URL",
+        help="Override the provider's Anthropic-compatible base URL",
     )
     p.add_argument(
         "--api-key-env", default="",
@@ -210,7 +206,7 @@ def parse_args() -> Config:
         "--model", default="",
         help="Model for both roles (legacy shorthand; role-specific flags win)",
     )
-    p.add_argument("--orchestrator-model", default="", help="Orchestrator model")
+    p.add_argument("--orchestrator-model", default="", help="Orchestrator API model")
     p.add_argument("--agent-model", default="", help="Analyst/programmer CLI model")
     p.add_argument(
         "--weights", default="",
@@ -220,6 +216,20 @@ def parse_args() -> Config:
         "--thresholds", default="",
         help='JSON per-metric thresholds, e.g. \'{"ccn":15,"nloc":30}\'',
     )
+    p.add_argument(
+        "--dynamic-mode", choices=("off", "observe", "enforce"), default="off",
+        help="Optional benchmark gate: off preserves static-only validation; observe records; enforce rejects regressions.",
+    )
+    p.add_argument("--dynamic-repetitions", type=int, default=7,
+                   help="Native benchmark repetitions/count for dynamic measurements")
+    p.add_argument("--dynamic-max-cv", type=float, default=0.10,
+                   help="Diagnostic high-CV threshold for MongoDB real_time (never rejects)")
+    p.add_argument("--dynamic-tolerance", type=float, default=0.05,
+                   help="Relative regression tolerance before dynamic penalty begins")
+    p.add_argument("--dynamic-weights", default="",
+                   help='JSON dynamic weights, e.g. {"ferretdb_ns_per_op":0.7,"ferretdb_bytes_per_op":0.3}')
+    p.add_argument("--dynamic-ferretdb-url-env", default="FERRETDB_BENCHMARK_POSTGRESQL_URL",
+                   help="Environment variable NAME holding the external FerretDB PostgreSQL URL")
     p.add_argument("--min-merge-gain", type=float, default=None,
                    help="Stagnation threshold in penalty units (paper: 10)")
     p.add_argument("--stagnation-limit", type=int, default=None,
@@ -291,7 +301,7 @@ def parse_args() -> Config:
         prewarm_build_cache = False
         build_timeout_sec = 60 * 60
         test_timeout_sec = 60 * 60
-        gate_timeout_sec = 3 * 60 * 60
+        gate_timeout_sec = 4 * 60 * 60
         allowed_untracked = ()
         repo_allowed_untracked = ()
         profile_baseline_ref = ""
@@ -363,6 +373,11 @@ def parse_args() -> Config:
         resume=args.resume,
         baseline_ref=args.baseline_ref or profile_baseline_ref,
         push_run_branch=args.push_run_branch,
+        dynamic_mode=args.dynamic_mode,
+        dynamic_repetitions=args.dynamic_repetitions,
+        dynamic_max_cv=args.dynamic_max_cv,
+        dynamic_tolerance=args.dynamic_tolerance,
+        dynamic_ferretdb_url_env=args.dynamic_ferretdb_url_env,
     )
 
     if args.model:
@@ -381,6 +396,18 @@ def parse_args() -> Config:
     if thresholds:
         _reject_unknown_metrics(thresholds, "thresholds")
         cfg.thresholds.update(thresholds)
+    dynamic_weights = _parse_json_dict(args.dynamic_weights, "dynamic-weights")
+    if dynamic_weights:
+        unknown = sorted(set(dynamic_weights) - {
+            "mongodb_real_time", "ferretdb_ns_per_op", "ferretdb_bytes_per_op",
+        })
+        if unknown:
+            raise SystemExit("--dynamic-weights: unknown metric key(s): " + ", ".join(unknown))
+        cfg.dynamic_weights.update(dynamic_weights)
+        try:
+            cfg.validate_dynamic_policy()
+        except ValueError as exc:
+            raise SystemExit(f"--dynamic-weights: {exc}") from exc
 
     if args.min_merge_gain is not None:
         cfg.min_merge_gain = args.min_merge_gain
@@ -401,6 +428,10 @@ def parse_args() -> Config:
 
 
 def main() -> None:
+    # Keep argument/configuration validation importable in a minimal offline
+    # environment.  The coordinator pulls provider SDKs only when a real run
+    # is about to start.
+    from coordination.coordinator import Coordinator
     cfg = parse_args()
     coordinator = Coordinator(cfg)
     coordinator.run()

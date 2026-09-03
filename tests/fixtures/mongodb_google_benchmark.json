@@ -1,0 +1,58 @@
+{
+  "context": {
+    "date": "2026-08-31T10:00:00+02:00",
+    "host_name": "benchmark-host",
+    "executable": "bazel-bin/src/mongo/db/query/query_planner_bm",
+    "num_cpus": 8,
+    "mhz_per_cpu": 3200,
+    "cpu_scaling_enabled": false,
+    "library_build_type": "opt"
+  },
+  "benchmarks": [
+    {
+      "name": "BM_One_mean",
+      "run_name": "BM_One/argument:1",
+      "run_type": "aggregate",
+      "aggregate_name": "mean",
+      "threads": 1,
+      "iterations": 5,
+      "real_time": 10.0,
+      "cpu_time": 9.0,
+      "time_unit": "us",
+      "label": "QueryClass=small Threads=1"
+    },
+    {
+      "name": "BM_One_median",
+      "run_name": "BM_One/argument:1",
+      "run_type": "aggregate",
+      "aggregate_name": "median",
+      "threads": 1,
+      "iterations": 5,
+      "real_time": 9.0,
+      "cpu_time": 8.0,
+      "time_unit": "us",
+      "label": "QueryClass=small Threads=1"
+    },
+    {
+      "name": "BM_One_stddev",
+      "run_name": "BM_One/argument:1",
+      "run_type": "aggregate",
+      "aggregate_name": "stddev",
+      "threads": 1,
+      "iterations": 5,
+      "real_time": 2.0,
+      "cpu_time": 1.5,
+      "time_unit": "us",
+      "label": "QueryClass=small Threads=1"
+    },
+    {
+      "name": "BM_IgnoreRaw",
+      "run_name": "BM_IgnoreRaw",
+      "run_type": "iteration",
+      "threads": 1,
+      "iterations": 1,
+      "real_time": 1.0,
+      "time_unit": "ns"
+    }
+  ]
+}

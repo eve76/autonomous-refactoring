@@ -134,9 +134,9 @@ with tempfile.TemporaryDirectory() as td:
           "baseline_commit" in summary and "integration_branch" in summary,
           summary.get("integration_branch", ""))
     summary_cfg = summary.get("config", {})
-    check("subscription transport records no API credential variable",
-          summary_cfg.get("api_provider") == "subscription"
-          and summary_cfg.get("api_key_env") == "")
+    check("provider and credential-variable name are recorded",
+          summary_cfg.get("api_provider") == "anthropic"
+          and summary_cfg.get("api_key_env") == "ANTHROPIC_API_KEY")
     check("API key value is never written to run_summary",
           "dummy-for-construction" not in json.dumps(summary))
     tokens = summary.get("tokens", {})

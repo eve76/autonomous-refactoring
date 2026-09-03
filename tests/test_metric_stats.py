@@ -383,7 +383,7 @@ def main() -> int:
               str(gate_cfg) in task_prompt
               and "--issue-id <ISSUE-ID>" in task_prompt)
         check("headless agent explicitly allows Bash and starts clean",
-              "--safe-mode" in cfg.agent_cli_extra_args
+              "--bare" in cfg.agent_cli_extra_args
               and "Bash" in " ".join(cfg.agent_cli_extra_args)
               and "--no-session-persistence" in cfg.agent_cli_extra_args)
 

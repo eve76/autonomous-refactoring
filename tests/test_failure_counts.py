@@ -111,6 +111,8 @@ EXPECTED_OUTCOMES = {
     gate_attempts.OUT_OF_SCOPE,
     gate_attempts.ATTEMPT_LIMIT,
     gate_attempts.DUPLICATE_PATCH,
+    gate_attempts.DYNAMIC_UNAVAILABLE,
+    gate_attempts.DYNAMIC_REGRESSION,
 }
 check("summarize covers every declared outcome",
       EXPECTED_OUTCOMES == set(gate_attempts.OUTCOMES),

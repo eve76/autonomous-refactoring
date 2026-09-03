@@ -1,0 +1,11 @@
+goos: linux
+goarch: amd64
+pkg: github.com/FerretDB/FerretDB/v2/integration
+cpu: Example CPU
+BenchmarkFind/ferretdb/Int32IDIndex-8          1000000  100.0 ns/op  128 B/op  4 allocs/op  1 docs-returned
+BenchmarkFind/ferretdb/Int32IDIndex-8          1000000  120.0 ns/op  128 B/op  4 allocs/op  1 docs-returned
+BenchmarkFind/ferretdb/Int32IDIndex-8          1000000  110.0 ns/op  128 B/op  4 allocs/op  1 docs-returned
+BenchmarkInsert/ferretdb/Batch10-8              100000  400.0 ns/op  256 B/op  8 allocs/op
+BenchmarkInsert/ferretdb/Batch10-8              100000  420.0 ns/op  256 B/op  8 allocs/op
+BenchmarkInsert/ferretdb/Batch10-8              100000  410.0 ns/op  256 B/op  8 allocs/op
+PASS

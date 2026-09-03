@@ -136,6 +136,7 @@ def main() -> int:
         ),
         build_timeout_sec=int(cfg.get("build_timeout_sec", 60 * 60)),
         test_timeout_sec=int(cfg.get("test_timeout_sec", 60 * 60)),
+        dynamic_config=cfg.get("dynamic_config"),
     )
     status_file = (
         Path(cfg["gate_status_file"])

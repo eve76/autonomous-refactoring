@@ -4,11 +4,33 @@
 import argparse
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 
 
 BASELINE_OUTPUT_BASE_ENV = "EXPERIMENT_BAZEL_OUTPUT_BASE"
+
+
+def _command_environment(profile: str) -> dict[str, str]:
+    """Return an execution environment safe for repository worktrees.
+
+    Go does not recognize the ``.git`` pointer file of a linked worktree when
+    discovering VCS metadata for a nested invocation.  FerretDB's ``TestDeps``
+    starts ``go list`` itself, so a command-line flag on the outer ``go test``
+    is insufficient; GOFLAGS must carry the policy into child Go commands.
+    """
+
+    env = os.environ.copy()
+    if profile != "ferretdb":
+        return env
+    flags = [
+        flag for flag in shlex.split(env.get("GOFLAGS", ""))
+        if not flag.startswith("-buildvcs")
+    ]
+    flags.append("-buildvcs=false")
+    env["GOFLAGS"] = shlex.join(flags)
+    return env
 
 
 def _require_checkout(profile: str, root: Path) -> None:
@@ -31,7 +53,8 @@ def _command(profile: str, action: str) -> list[str]:
         if not go:
             raise SystemExit("Go toolchain not found")
         common = [
-            str(Path(go).resolve()), "-race", "-tags=ferretdb_dev", "./...",
+            str(Path(go).resolve()), "-buildvcs=false", "-race",
+            "-tags=ferretdb_dev", "./...",
         ]
         if action == "build":
             return [common[0], "test", "-run=^$", *common[1:]]
@@ -94,10 +117,11 @@ def main() -> int:
     root = Path.cwd()
     _require_checkout(args.profile, root)
     output_base = os.environ.get(BASELINE_OUTPUT_BASE_ENV, "").strip()
+    command_env = _command_environment(args.profile)
     try:
         for command in _commands(args.profile, args.action):
             print("+ " + " ".join(command), flush=True)
-            result = subprocess.run(command, cwd=str(root))
+            result = subprocess.run(command, cwd=str(root), env=command_env)
             if result.returncode:
                 return result.returncode
         return 0
