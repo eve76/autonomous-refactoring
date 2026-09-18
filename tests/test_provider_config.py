@@ -266,6 +266,7 @@ with tempfile.TemporaryDirectory() as td:
         parsed = parse_args()
         check("FerretDB production profile locks full-repo Go scope",
               parsed.production_profile == "ferretdb"
+              and parsed.baseline_ref == "39afbdcafe3f00fc029e0e2b704640970bed8b4b"
               and parsed.target_subdir == "."
               and parsed.lizard_language == "go"
               and parsed.sparse_worktrees is False
@@ -286,6 +287,7 @@ with tempfile.TemporaryDirectory() as td:
         parsed = parse_args()
         check("MongoDB profile is locked to the query module",
               parsed.production_profile == "mongodb-query"
+              and parsed.baseline_ref == "fbb28cf8c44023d334a646fe496fb95d355dc6f0"
               and parsed.target_subdir == "src/mongo/db/query"
               and parsed.lizard_language == "cpp"
               and parsed.sparse_worktrees is False
