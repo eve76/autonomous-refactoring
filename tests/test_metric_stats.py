@@ -371,6 +371,8 @@ def main() -> int:
         check("Go dupl settings written",
               payload["dupl_binary"] == "/opt/tools/dupl"
               and payload["dupl_threshold_tokens"] == 123)
+        check("custom profile leaves gate serialization disabled",
+              payload["gate_serialization_lock"] == "")
         check("gate config is outside the target worktree",
               not gate_cfg.is_relative_to(wt), str(gate_cfg))
         task_prompt = session._build_task_prompt([{

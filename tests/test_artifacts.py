@@ -59,7 +59,12 @@ with tempfile.TemporaryDirectory() as td:
     print("\n[3] crash-recovery state round-trip")
     s = RunState(run_id="20260729_101500", started_at=1.0,
                  baseline_commit="0123456789abcdef", baseline_penalty=500.0,
-                 current_penalty=465.0, stagnation_counter=2, merges=2)
+                 current_penalty=465.0, stagnation_counter=2, merges=2,
+                 optimization_core_fingerprint="core-fingerprint",
+                 provider_transitions=[{
+                     "from_provider": "subscription",
+                     "to_provider": "openrouter",
+                 }])
     s.save(root / "run_state.json")
     check("state file written", (root / "run_state.json").exists())
     back = RunState.load(root / "run_state.json")
@@ -69,6 +74,10 @@ with tempfile.TemporaryDirectory() as td:
     check("stagnation survives round-trip", back.stagnation_counter == 2)
     check("merges survive round-trip", back.merges == 2)
     check("run_id survives round-trip", back.run_id == "20260729_101500")
+    check("core fingerprint survives round-trip",
+          back.optimization_core_fingerprint == "core-fingerprint")
+    check("provider transition survives round-trip",
+          back.provider_transitions[0]["to_provider"] == "openrouter")
     check("updated_at stamped", back.updated_at > 0)
     check("missing file returns None", RunState.load(root / "nope.json") is None)
     (root / "corrupt.json").write_text("{not json")

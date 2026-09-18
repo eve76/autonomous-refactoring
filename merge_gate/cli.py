@@ -14,6 +14,7 @@ and exits non-zero when the gate rejects the change.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -54,6 +55,27 @@ def _read_accumulated_gate_time(path: Path) -> float:
     except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError,
             OSError):
         return 0.0
+
+
+def _acquire_gate_lock(path: Path):
+    """Block until this process exclusively owns the run's merge gate."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def _release_gate_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def main() -> int:
@@ -141,18 +163,46 @@ def main() -> int:
         Path(cfg["gate_status_file"])
         if cfg.get("gate_status_file") else None
     )
+    gate_lock_path = (
+        Path(cfg["gate_serialization_lock"])
+        if cfg.get("gate_serialization_lock") else None
+    )
+    accumulated_sec = 0.0
+    gate_queued_at = time.time()
     if status_file is not None:
         accumulated_sec = _read_accumulated_gate_time(status_file)
-        gate_started_at = time.time()
         _write_gate_status(status_file, {
             "agent_id": cfg.get("agent_id", ""),
             "issue_id": args.issue_id,
             "pid": os.getpid(),
-            "started_at": gate_started_at,
+            "started_at": gate_queued_at,
             "accumulated_sec": accumulated_sec,
             "active": True,
+            "phase": (
+                "waiting_for_serial_gate" if gate_lock_path else "running"
+            ),
+            "running_started_at": (
+                None if gate_lock_path else gate_queued_at
+            ),
         })
+    lock_handle = None
     try:
+        if gate_lock_path is not None:
+            lock_handle = _acquire_gate_lock(gate_lock_path)
+            running_started_at = time.time()
+            if status_file is not None:
+                _write_gate_status(status_file, {
+                    "agent_id": cfg.get("agent_id", ""),
+                    "issue_id": args.issue_id,
+                    "pid": os.getpid(),
+                    # Preserve the queue-entry time so all non-model time is
+                    # subtracted from Programmer runtime accounting.
+                    "started_at": gate_queued_at,
+                    "running_started_at": running_started_at,
+                    "accumulated_sec": accumulated_sec,
+                    "active": True,
+                    "phase": "running",
+                })
         result = gate.run()
     finally:
         if status_file is not None:
@@ -161,13 +211,15 @@ def main() -> int:
                 "agent_id": cfg.get("agent_id", ""),
                 "issue_id": args.issue_id,
                 "pid": os.getpid(),
-                "started_at": gate_started_at,
+                "started_at": gate_queued_at,
                 "finished_at": finished_at,
                 "accumulated_sec": (
-                    accumulated_sec + max(0.0, finished_at - gate_started_at)
+                    accumulated_sec + max(0.0, finished_at - gate_queued_at)
                 ),
                 "active": False,
+                "phase": "finished",
             })
+        _release_gate_lock(lock_handle)
     print(json.dumps(asdict(result)))
     return 0 if result.success else 1
 

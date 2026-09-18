@@ -49,13 +49,52 @@ def emit_structured(payload: dict) -> None:
         "total_cost_usd": 0.005,
         "usage": {"input_tokens": 300, "output_tokens": 30},
         "modelUsage": {
-            "claude-opus-4-7": {
+            "claude-opus-5": {
                 "inputTokens": 300,
                 "cacheCreationInputTokens": 0,
                 "cacheReadInputTokens": 0,
                 "outputTokens": 30,
             },
         },
+    }), flush=True)
+
+
+def emit_schema_rejected_structured(payload: dict) -> None:
+    """Mirror Claude Code rejecting a usable tool input at the schema edge."""
+    tool_id = "toolu_fake_schema_rejection"
+    print(json.dumps({
+        "type": "assistant",
+        "message": {
+            "content": [{
+                "type": "tool_use",
+                "name": "StructuredOutput",
+                "id": tool_id,
+                "input": payload,
+            }],
+        },
+    }), flush=True)
+    print(json.dumps({
+        "type": "user",
+        "message": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "is_error": True,
+                "content": (
+                    "Output does not match required schema: root: "
+                    "must NOT have additional properties"
+                ),
+            }],
+        },
+    }), flush=True)
+    print(json.dumps({
+        "type": "result",
+        "subtype": "error_max_turns",
+        "is_error": True,
+        "stop_reason": "tool_use",
+        "errors": ["Reached maximum number of turns (1)"],
+        "num_turns": 2,
+        "usage": {"input_tokens": 300, "output_tokens": 30},
     }), flush=True)
 
 
@@ -212,6 +251,17 @@ def main() -> int:
     if "programmer agent" in args.append_system_prompt:
         return programmer(task_prompt, Path.cwd())
     if "deterministic decision component" in args.system_prompt:
+        if "harmless extra field" in task_prompt:
+            emit_schema_rejected_structured({
+                "programmer_assignments": [{
+                    "programmer_id": "PROG_3",
+                    "issue_ids": ["ISSUE-0016", "ISSUE-0026"],
+                }],
+                "analyst_assignments": [],
+                "reasoning": "fake tolerant subscription decision",
+                "issue_ids": "[\"ISSUE-0016\", \"ISSUE-0026\"]",
+            })
+            return 1
         if "STUCK PROGRAMMERS" in task_prompt:
             emit_structured({
                 "terminate": [], "keep": [], "infeasible_issues": [],

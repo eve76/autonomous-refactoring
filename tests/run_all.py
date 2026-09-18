@@ -19,7 +19,7 @@ SUITES = [
     ("two-tier stuck-agent policy", "test_stuck_policy.py"),
     ("gate failure counts (§5.1 / §5.4)", "test_failure_counts.py"),
     ("issue attempt history and dispatch limits", "test_issue_attempt_policy.py"),
-    ("Anthropic / DeepSeek provider configuration", "test_provider_config.py"),
+    ("Anthropic / OpenRouter / DeepSeek provider configuration", "test_provider_config.py"),
     ("provider-neutral token usage accounting", "test_token_usage.py"),
     ("Go cognitive complexity via gocognit", "test_go_cognitive.py"),
     ("conservative token-saving stages 2 and 3", "test_token_optimizations.py"),

@@ -312,9 +312,15 @@ with tempfile.TemporaryDirectory() as td:
     quota_log = root / "quota.log"
     quota_log.write_text(json.dumps({
         "type": "result", "is_error": True,
-        "result": "Claude usage limit reached; resets in 2 hours",
+        "result": "You've hit your session limit · resets 7:40pm (Europe/Stockholm)",
     }) + "\n")
     check("subscription quota terminal errors are recognized",
+          has_subscription_quota_error(quota_log))
+    quota_log.write_text(json.dumps({
+        "type": "result", "is_error": True,
+        "result": "You've hit your weekly limit · resets Sep 12, 9am (Europe/Stockholm)",
+    }) + "\n")
+    check("weekly subscription limit errors are recognized",
           has_subscription_quota_error(quota_log))
 
 
@@ -420,6 +426,55 @@ with tempfile.TemporaryDirectory() as td:
           and coordinator.agent_crashes == 0
           and coordinator.stop_reason == "")
 
+    class QuotaGateSession:
+        assigned_issues = ["ISSUE-0001", "ISSUE-0002"]
+        gate_record_start = 0
+        active = True
+
+        def gate_active(self):
+            return self.active
+
+    session = QuotaGateSession()
+    coordinator.programmer_sessions = {"PROG_1": session}
+    coordinator.backlog.add_issue(issue("ISSUE-0001", IN_PROGRESS))
+    coordinator.backlog.add_issue(Issue(
+        id="ISSUE-0002", file_path="src/b.cc", line=2, severity="high",
+        issue_type="complexity", message="CCN=21", metric_values={"ccn": 21},
+        status=IN_PROGRESS, assigned_to="PROG_1",
+    ))
+    coordinator._apply_message(mq.Message(
+        sender="PROG_1", kind=mq.PROGRAMMER_FINISHED,
+        payload={
+            "returncode": 1,
+            "subscription_quota_exhausted": True,
+        },
+    ))
+    check("quota keeps detached gate assignments recoverable",
+          all(item.status == IN_PROGRESS
+              for item in coordinator.backlog.snapshot().items.values()))
+    check("quota shutdown waits for a live detached gate",
+          coordinator._settle_subscription_quota() is False)
+
+    from coordination import gate_attempts
+    gate_attempts.append(
+        cfg.run_results_path / cfg.gate_attempts_filename,
+        {
+            "agent": "PROG_1", "issue_id": "ISSUE-0001",
+            "outcome": gate_attempts.MERGED,
+            "penalty_before": 100.0, "penalty_after": 80.0,
+        },
+    )
+    coordinator._apply_merge_result = lambda msg: coordinator.backlog.mark_done(
+        msg.payload["issue_id"]
+    )
+    session.active = False
+    coordinator._recover_active_gate_merges()
+    check("detached gate merge is recovered after quota exhaustion",
+          coordinator.backlog.snapshot().items["ISSUE-0001"].status == DONE)
+    check("quota settles only after returning unmerged work to TODO",
+          coordinator._settle_subscription_quota()
+          and coordinator.backlog.snapshot().items["ISSUE-0002"].status == TODO)
+
 
 print("\n[5] no-progress, resume and path-safety guards are bounded")
 with tempfile.TemporaryDirectory() as td:
@@ -478,9 +533,56 @@ with tempfile.TemporaryDirectory() as td:
           == coordinator._conflict_file_key("./src/a.cc"))
 
     original_fingerprint = coordinator._optimization_fingerprint()
+    original_core_fingerprint = coordinator._optimization_core_fingerprint()
     cfg.analyst_lead_page_size += 1
     check("candidate-affecting configuration changes the fingerprint",
           coordinator._optimization_fingerprint() != original_fingerprint)
+    check("candidate-affecting configuration changes the core fingerprint",
+          coordinator._optimization_core_fingerprint()
+          != original_core_fingerprint)
+
+    transition_cfg = Config(
+        repo_root=repo, target_subdir="src", work_root=root / "work",
+        run_id="guards", api_provider="openrouter",
+    )
+    transition = Coordinator(
+        transition_cfg, orchestrator=SimpleNamespace(),
+    )
+    source_cfg = Config(
+        repo_root=repo, target_subdir="src", work_root=root / "work",
+        run_id="guards", api_provider="subscription",
+    )
+    source = Coordinator(source_cfg, orchestrator=SimpleNamespace())
+    safe_state = RunState(
+        run_id="guards",
+        api_provider="subscription",
+        orchestrator_model="claude-opus-5",
+        agent_model="claude-opus-5",
+        stop_reason="subscription_quota_exhausted",
+        optimization_core_fingerprint=source._optimization_core_fingerprint(),
+    )
+    check("safe subscription pause may resume through equivalent OpenRouter",
+          transition._validate_resume_configuration(safe_state))
+    unsafe_state = RunState(**{
+        **safe_state.__dict__, "stop_reason": "stagnation",
+    })
+    try:
+        transition._validate_resume_configuration(unsafe_state)
+    except RuntimeError as exc:
+        check("completed runs cannot switch providers on resume",
+              "allowed safe pause" in str(exc))
+    else:
+        check("completed runs cannot switch providers on resume", False)
+    changed_state = RunState(**{
+        **safe_state.__dict__, "optimization_core_fingerprint": "different",
+    })
+    try:
+        transition._validate_resume_configuration(changed_state)
+    except RuntimeError as exc:
+        check("provider switch cannot hide core configuration changes",
+              "core experiment configuration changed" in str(exc))
+    else:
+        check("provider switch cannot hide core configuration changes", False)
 
     check("summary URL strips credentials, query and fragment",
           coordinator._safe_api_base_url(

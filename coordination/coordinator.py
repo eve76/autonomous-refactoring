@@ -75,6 +75,12 @@ from analysis.penalty import (
 )
 
 
+_SAFE_SUBSCRIPTION_SWITCH_REASONS = frozenset({
+    "subscription_quota_exhausted",
+    "wall_timeout",
+})
+
+
 class Coordinator:
     def __init__(self, cfg: Config, orchestrator=None):
         self.cfg = cfg
@@ -198,25 +204,22 @@ class Coordinator:
                     f"cannot resume run {self.cfg.run_id!r} from state for "
                     f"{restored.run_id!r}"
                 )
-            for field, current in (
-                ("api_provider", self.cfg.api_provider),
-                ("orchestrator_model", self.cfg.orchestrator_model),
-                ("agent_model", self.cfg.agent_model),
-            ):
-                previous = getattr(restored, field, "")
-                if previous and previous != current:
-                    raise RuntimeError(
-                        f"cannot resume with a different {field}: "
-                        f"{previous!r} -> {current!r}"
-                    )
-            fingerprint = self._optimization_fingerprint()
-            if (
-                restored.optimization_fingerprint
-                and restored.optimization_fingerprint != fingerprint
-            ):
-                raise RuntimeError(
-                    "cannot resume after token-optimization configuration "
-                    "changed; use a new --run-id"
+            provider_switched = self._validate_resume_configuration(restored)
+            if provider_switched:
+                restored.provider_transitions.append({
+                    "timestamp": time.time(),
+                    "reason": restored.stop_reason,
+                    "from_provider": restored.api_provider,
+                    "to_provider": self.cfg.api_provider,
+                    "from_orchestrator_model": restored.orchestrator_model,
+                    "to_orchestrator_model": self.cfg.orchestrator_model,
+                    "from_agent_model": restored.agent_model,
+                    "to_agent_model": self.cfg.agent_model,
+                })
+                print(
+                    "[coordinator] approved safe resume transport switch: "
+                    f"{restored.api_provider} -> {self.cfg.api_provider} "
+                    f"after {restored.stop_reason}"
                 )
             if (
                 restored.analyst_lead_seen_keys
@@ -664,6 +667,9 @@ class Coordinator:
         self.state.optimization_fingerprint = (
             self._optimization_fingerprint()
         )
+        self.state.optimization_core_fingerprint = (
+            self._optimization_core_fingerprint()
+        )
         self.state.original_checkout_ref = self.original_checkout_ref
         self.state.original_checkout_commit = self.original_checkout_commit
         self.state.original_checkout_detached = self.original_checkout_detached
@@ -756,6 +762,7 @@ class Coordinator:
             },
             "integration_branch": self.cfg.integration_branch,
             "run_branch_pushed": self.run_branch_pushed,
+            "provider_transitions": list(self.state.provider_transitions),
             "elapsed_sec": round(time.time() - self.started_at, 2),
             "baseline_penalty": self.baseline_penalty,
             "final_penalty": self.current_penalty,
@@ -991,12 +998,7 @@ class Coordinator:
             budget_closed = self._check_token_budget()
             if self.stop_reason:
                 break
-            if (
-                self.subscription_quota_closed
-                and not self.programmer_futures
-                and not self.analyst_futures
-                and self.queue.empty()
-            ):
+            if self._settle_subscription_quota():
                 self.stop_reason = "subscription_quota_exhausted"
                 break
             self._check_no_actionable_stop()
@@ -1094,7 +1096,14 @@ class Coordinator:
                 # A crash, context exhaustion, or malformed/missing RESULT
                 # line must not strand assignments in IN_PROGRESS forever.
                 session = self.programmer_sessions.get(msg.sender)
-                if session is not None:
+                if (
+                    session is not None
+                    and not bool(msg.payload.get("subscription_quota_exhausted"))
+                    and not (
+                        self.subscription_quota_closed
+                        and session.gate_active()
+                    )
+                ):
                     snapshot = self.backlog.snapshot()
                     for iid in session.assigned_issues:
                         item = snapshot.items.get(iid)
@@ -1217,12 +1226,13 @@ class Coordinator:
             )
         return True
 
-    def _optimization_fingerprint(self) -> str:
-        """Identify settings that affect compact selection and lead pages."""
-        payload = {
-            # Schema 6 also binds production validation and pricing. Refuse cross-version
+    def _optimization_fingerprint_payload(self) -> dict:
+        """Return the complete resume identity, including model transport."""
+        return {
+            # Schema 8 also binds production validation, gate scheduling, and
+            # pricing. Refuse cross-version
             # resume rather than silently changing build/test or tool scope.
-            "schema": 7,
+            "schema": 8,
             "repo_root": str(self.cfg.repo_root.resolve()),
             "production_profile": self.cfg.production_profile,
             "target_subdir": self.cfg.target_subdir,
@@ -1230,6 +1240,7 @@ class Coordinator:
             "language": self.cfg.lizard_language,
             "build_cmd": self.cfg.build_cmd,
             "test_cmd": self.cfg.test_cmd,
+            "serialize_merge_gate": self.cfg.serialize_merge_gate,
             "lizard_binary": self.cfg.lizard_binary,
             "gocognit_binary": self.cfg.gocognit_binary,
             "duplo_binary": self.cfg.duplo_binary,
@@ -1260,10 +1271,91 @@ class Coordinator:
             "agent_model": self.cfg.agent_model,
             "pricing_snapshot": pricing_snapshot(),
         }
+    @staticmethod
+    def _hash_fingerprint_payload(payload: dict) -> str:
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"),
         ).encode()
         return hashlib.sha256(encoded).hexdigest()
+
+    def _optimization_fingerprint(self) -> str:
+        """Identify settings that affect the run, including its transport."""
+        return self._hash_fingerprint_payload(
+            self._optimization_fingerprint_payload()
+        )
+
+    def _optimization_core_fingerprint(self) -> str:
+        """Identify every run setting except the model transport identity."""
+        payload = self._optimization_fingerprint_payload()
+        payload["schema"] = "transport-neutral-v1"
+        for field in (
+            "api_provider",
+            "subscription_type",
+            "claude_cli_version",
+            "orchestrator_model",
+            "agent_model",
+        ):
+            payload.pop(field)
+        return self._hash_fingerprint_payload(payload)
+
+    def _validate_resume_configuration(self, restored: RunState) -> bool:
+        """Validate strict resume, or one safe subscription -> OR transition."""
+        provider_switched = (
+            restored.api_provider == "subscription"
+            and self.cfg.api_provider == "openrouter"
+        )
+        if provider_switched:
+            if restored.stop_reason not in _SAFE_SUBSCRIPTION_SWITCH_REASONS:
+                raise RuntimeError(
+                    "cannot switch subscription to OpenRouter after stop "
+                    f"reason {restored.stop_reason!r}; allowed safe pause "
+                    "reasons are subscription_quota_exhausted and wall_timeout"
+                )
+            if not restored.optimization_core_fingerprint:
+                raise RuntimeError(
+                    "cannot switch a legacy subscription run to OpenRouter "
+                    "without a transport-neutral optimization fingerprint"
+                )
+            if (
+                restored.optimization_core_fingerprint
+                != self._optimization_core_fingerprint()
+            ):
+                raise RuntimeError(
+                    "cannot switch subscription to OpenRouter after core "
+                    "experiment configuration changed"
+                )
+            for field in ("orchestrator_model", "agent_model"):
+                previous = getattr(restored, field, "")
+                expected = f"anthropic/{previous}"
+                current = getattr(self.cfg, field)
+                if not previous or current != expected:
+                    raise RuntimeError(
+                        "cannot switch subscription to OpenRouter with a "
+                        f"non-equivalent {field}: {previous!r} -> {current!r}"
+                    )
+            return True
+
+        for field, current in (
+            ("api_provider", self.cfg.api_provider),
+            ("orchestrator_model", self.cfg.orchestrator_model),
+            ("agent_model", self.cfg.agent_model),
+        ):
+            previous = getattr(restored, field, "")
+            if previous and previous != current:
+                raise RuntimeError(
+                    f"cannot resume with a different {field}: "
+                    f"{previous!r} -> {current!r}"
+                )
+        fingerprint = self._optimization_fingerprint()
+        if (
+            restored.optimization_fingerprint
+            and restored.optimization_fingerprint != fingerprint
+        ):
+            raise RuntimeError(
+                "cannot resume after token-optimization configuration "
+                "changed; use a new --run-id"
+            )
+        return False
 
     @staticmethod
     def _safe_api_base_url(raw: str) -> str:
@@ -1493,7 +1585,10 @@ class Coordinator:
             # Terminating programmers remain eligible: a gate may persist a
             # successful merge in the narrow window between the pre-kill
             # reconciliation and process-group termination.
-            if pid not in self.programmer_futures:
+            if (
+                pid not in self.programmer_futures
+                and not self.subscription_quota_closed
+            ):
                 continue
             assigned = set(session.assigned_issues)
             for record in records[session.gate_record_start:]:
@@ -1532,6 +1627,34 @@ class Coordinator:
                         f"({issue_id}) before agent completion"
                     )
         return recovered
+
+    def _settle_subscription_quota(self) -> bool:
+        """Wait for detached gates, then release their unresolved work."""
+        if (
+            not self.subscription_quota_closed
+            or self.programmer_futures
+            or self.analyst_futures
+            or not self.queue.empty()
+        ):
+            return False
+        if any(session.gate_active() for session in self.programmer_sessions.values()):
+            return False
+
+        dirty = False
+        snapshot = self.backlog.snapshot()
+        for pid, session in self.programmer_sessions.items():
+            for iid in session.assigned_issues:
+                item = snapshot.items.get(iid)
+                if (
+                    item is not None
+                    and item.status == IN_PROGRESS
+                    and item.assigned_to == pid
+                ):
+                    self.backlog.return_to_todo(iid)
+                    dirty = True
+        if dirty:
+            self.backlog.persist()
+        return True
 
     @staticmethod
     def _idle(sessions: dict, futures: dict) -> list[str]:

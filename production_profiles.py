@@ -38,6 +38,7 @@ class ProductionProfile:
     build_timeout_sec: int
     test_timeout_sec: int
     gate_timeout_sec: int
+    serialize_merge_gate: bool
     lizard_binary: str
     gocognit_binary: str
     duplo_binary: str
@@ -60,6 +61,7 @@ def get_production_profile(name: str) -> ProductionProfile:
     if name == "ferretdb":
         return ProductionProfile(
             name=name,
+            baseline_ref="39afbdcafe3f00fc029e0e2b704640970bed8b4b",
             repo_root=(WORKSPACE_ROOT / "ferret-dev" / "FerretDB").resolve(),
             work_root=(PROJECT_ROOT / "production_runs" / name).resolve(),
             target_subdir=".",
@@ -71,6 +73,7 @@ def get_production_profile(name: str) -> ProductionProfile:
             build_timeout_sec=45 * 60,
             test_timeout_sec=45 * 60,
             gate_timeout_sec=2 * 60 * 60,
+            serialize_merge_gate=False,
             lizard_binary=project_tool("lizard"),
             gocognit_binary=project_tool("gocognit"),
             duplo_binary="",
@@ -91,6 +94,7 @@ def get_production_profile(name: str) -> ProductionProfile:
         )
     return ProductionProfile(
         name=name,
+        baseline_ref="fbb28cf8c44023d334a646fe496fb95d355dc6f0",
         repo_root=(WORKSPACE_ROOT / "dev" / "mongo").resolve(),
         work_root=(PROJECT_ROOT / "production_runs" / name).resolve(),
         target_subdir="src/mongo/db/query",
@@ -107,6 +111,7 @@ def get_production_profile(name: str) -> ProductionProfile:
         build_timeout_sec=2 * 60 * 60,
         test_timeout_sec=4 * 60 * 60,
         gate_timeout_sec=7 * 60 * 60,
+        serialize_merge_gate=True,
         lizard_binary=project_tool("lizard"),
         gocognit_binary=project_tool("gocognit"),
         duplo_binary=str((PROJECT_ROOT / "bin" / "duplo").resolve()),

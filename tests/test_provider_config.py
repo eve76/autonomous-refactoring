@@ -1,4 +1,4 @@
-"""Verify Anthropic/DeepSeek provider selection without making API calls."""
+"""Verify Anthropic/OpenRouter/DeepSeek provider selection without API calls."""
 
 import json
 import os
@@ -12,7 +12,12 @@ sys.path.insert(0, str(EXP))
 
 from agents import provider                                             # noqa: E402
 from agents.orchestrator import Orchestrator                            # noqa: E402
-from config import Config, DEEPSEEK_ANTHROPIC_BASE_URL                  # noqa: E402
+from config import (                                                    # noqa: E402
+    Config,
+    DEEPSEEK_ANTHROPIC_BASE_URL,
+    OPENROUTER_ANTHROPIC_BASE_URL,
+    OPENROUTER_OPUS_MODEL,
+)
 from main import load_project_dotenv, parse_args                        # noqa: E402
 from scripts import production_validation                               # noqa: E402
 
@@ -51,10 +56,23 @@ with tempfile.TemporaryDirectory() as td:
           and "--bare" not in subscription_cfg.agent_cli_extra_args)
     anthropic_cfg = cfg(root, api_provider="anthropic")
     check("Anthropic keeps the Opus defaults",
-          anthropic_cfg.orchestrator_model == "claude-opus-4-7"
-          and anthropic_cfg.agent_model == "claude-opus-4-7")
+          anthropic_cfg.orchestrator_model == "claude-opus-5"
+          and anthropic_cfg.agent_model == "claude-opus-5")
     check("Anthropic uses its standard key variable",
           anthropic_cfg.effective_api_key_env == "ANTHROPIC_API_KEY")
+
+    openrouter_cfg = cfg(root, api_provider="OpenRouter")
+    check("OpenRouter selects its Anthropic skin and key variable",
+          openrouter_cfg.api_provider == "openrouter"
+          and openrouter_cfg.effective_api_base_url
+          == OPENROUTER_ANTHROPIC_BASE_URL
+          and openrouter_cfg.effective_api_key_env == "OPENROUTER_API_KEY")
+    check("OpenRouter pins the equivalent Opus 5 slug for both roles",
+          openrouter_cfg.orchestrator_model == OPENROUTER_OPUS_MODEL
+          and openrouter_cfg.agent_model == OPENROUTER_OPUS_MODEL)
+    check("OpenRouter accepts an audited USD cost ceiling",
+          cfg(root, api_provider="openrouter", max_run_cost_usd=5.0)
+          .max_run_cost_usd == 5.0)
 
     deepseek_cfg = cfg(root, api_provider="DeepSeek")
     check("provider names are normalized",
@@ -133,6 +151,43 @@ with tempfile.TemporaryDirectory() as td:
     check("Config stores the key name, never its value",
           "secret-test-value" not in repr(deepseek_cfg))
 
+    openrouter_cfg = cfg(root, api_provider="openrouter")
+    openrouter_child = provider.agent_subprocess_environment(
+        openrouter_cfg,
+        {
+            "PATH": os.environ.get("PATH", ""),
+            "OPENROUTER_API_KEY": "secret-openrouter-value",
+            "ANTHROPIC_API_KEY": "ambient-anthropic-key",
+        },
+    )
+    check("OpenRouter endpoint and auth token are private child settings",
+          openrouter_child["ANTHROPIC_BASE_URL"]
+          == OPENROUTER_ANTHROPIC_BASE_URL
+          and openrouter_child["ANTHROPIC_AUTH_TOKEN"]
+          == "secret-openrouter-value")
+    check("OpenRouter explicitly blanks the conflicting Anthropic key",
+          openrouter_child["ANTHROPIC_API_KEY"] == "")
+    check("OpenRouter pins agent, class, and subagent model routing",
+          all(openrouter_child[name] == OPENROUTER_OPUS_MODEL for name in (
+              "ANTHROPIC_MODEL",
+              "ANTHROPIC_DEFAULT_OPUS_MODEL",
+              "ANTHROPIC_DEFAULT_SONNET_MODEL",
+              "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+              "CLAUDE_CODE_SUBAGENT_MODEL",
+          )))
+    check("OpenRouter does not inherit DeepSeek effort controls",
+          "CLAUDE_CODE_EFFORT_LEVEL" not in openrouter_child)
+    check("OpenRouter agents use isolated API mode",
+          "--bare" in openrouter_cfg.agent_cli_extra_args
+          and "--safe-mode" not in openrouter_cfg.agent_cli_extra_args)
+    try:
+        provider.agent_subprocess_environment(openrouter_cfg, {})
+    except RuntimeError as exc:
+        check("missing OpenRouter key fails before agent launch",
+              "OPENROUTER_API_KEY" in str(exc))
+    else:
+        check("missing OpenRouter key fails before agent launch", False)
+
     subscription_parent = {
         "PATH": os.environ.get("PATH", ""),
         "ANTHROPIC_API_KEY": "must-not-reach-child",
@@ -180,6 +235,28 @@ with tempfile.TemporaryDirectory() as td:
           captured_client.get("base_url") == DEEPSEEK_ANTHROPIC_BASE_URL)
     check("SDK receives the provider key",
           captured_client.get("api_key") == "secret-sdk-value")
+
+    openrouter_cfg = cfg(root, api_provider="openrouter")
+    captured_openrouter = {}
+
+    class FakeOpenRouterAnthropic:
+        def __init__(self, **kwargs):
+            captured_openrouter.update(kwargs)
+
+    try:
+        provider.Anthropic = FakeOpenRouterAnthropic
+        provider.make_orchestrator_client(
+            openrouter_cfg,
+            {"OPENROUTER_API_KEY": "secret-openrouter-sdk-value"},
+        )
+    finally:
+        provider.Anthropic = real_anthropic
+    check("OpenRouter SDK uses the native Anthropic skin",
+          captured_openrouter.get("base_url")
+          == OPENROUTER_ANTHROPIC_BASE_URL)
+    check("OpenRouter SDK receives only its provider key",
+          captured_openrouter.get("api_key")
+          == "secret-openrouter-sdk-value")
 
     request = {}
 
@@ -277,6 +354,17 @@ with tempfile.TemporaryDirectory() as td:
           and usage_event["input_tokens"] == 300
           and usage_event["output_tokens"] == 30)
 
+    tolerant_payload = subscription_orchestrator._call(
+        "Return an assignment with one harmless extra field.", "assignment",
+    )
+    tolerant_decision = subscription_orchestrator._parse_assignment(
+        tolerant_payload
+    )
+    check("subscription accepts typed input like the DeepSeek parser",
+          tolerant_decision.programmer_assignments == {
+              "PROG_3": ["ISSUE-0016", "ISSUE-0026"],
+          })
+
 
 print("\n[4] command-line provider selection and role-specific overrides")
 with tempfile.TemporaryDirectory() as td:
@@ -293,6 +381,22 @@ with tempfile.TemporaryDirectory() as td:
         parsed = parse_args()
         check("CLI defaults every model role to subscription transport",
               parsed.api_provider == "subscription")
+
+        sys.argv = [
+            "main.py",
+            "--repo", str(root / "repo"),
+            "--work-root", str(root / "work"),
+            "--build-cmd", "echo build",
+            "--test-cmd", "echo test",
+            "--provider", "openrouter",
+        ]
+        parsed = parse_args()
+        check("--provider openrouter applies safe gateway defaults",
+              parsed.effective_api_base_url
+              == OPENROUTER_ANTHROPIC_BASE_URL
+              and parsed.effective_api_key_env == "OPENROUTER_API_KEY"
+              and parsed.orchestrator_model == OPENROUTER_OPUS_MODEL
+              and parsed.agent_model == OPENROUTER_OPUS_MODEL)
 
         sys.argv = [
             "main.py",
@@ -337,9 +441,11 @@ with tempfile.TemporaryDirectory() as td:
         parsed = parse_args()
         check("FerretDB production profile locks full-repo Go scope",
               parsed.production_profile == "ferretdb"
+              and parsed.baseline_ref == "39afbdcafe3f00fc029e0e2b704640970bed8b4b"
               and parsed.target_subdir == "."
               and parsed.lizard_language == "go"
               and parsed.sparse_worktrees is False
+              and parsed.serialize_merge_gate is False
               and parsed.dupl_binary.endswith("/dupl")
               and parsed.dupl_threshold_tokens == 100
               and parsed.duplo_binary == "")
@@ -358,9 +464,11 @@ with tempfile.TemporaryDirectory() as td:
         parsed = parse_args()
         check("MongoDB profile is locked to the query module",
               parsed.production_profile == "mongodb-query"
+              and parsed.baseline_ref == "fbb28cf8c44023d334a646fe496fb95d355dc6f0"
               and parsed.target_subdir == "src/mongo/db/query"
               and parsed.lizard_language == "cpp"
               and parsed.sparse_worktrees is False
+              and parsed.serialize_merge_gate is True
               and parsed.dupl_binary == ""
               and parsed.duplo_binary.endswith("/duplo")
               and parsed.duplo_min_block_lines == 4)

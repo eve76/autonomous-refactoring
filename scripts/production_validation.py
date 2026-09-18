@@ -49,7 +49,12 @@ def _command(profile: str, action: str) -> list[str]:
         / "production_runs" / "mongodb-query" / "bazel_disk_cache"
     )
     disk_cache.mkdir(parents=True, exist_ok=True)
-    common = ["--config=local", f"--disk_cache={disk_cache}"]
+    common = [
+        "--config=local",
+        f"--disk_cache={disk_cache}",
+        "--experimental_disk_cache_gc_max_size=150G",
+        "--experimental_disk_cache_gc_idle_delay=1m",
+    ]
     startup = [str(Path(bazel).resolve())]
     output_base = os.environ.get(BASELINE_OUTPUT_BASE_ENV, "").strip()
     if output_base:

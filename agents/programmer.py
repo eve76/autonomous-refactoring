@@ -122,7 +122,12 @@ class ProgrammerSession:
         status = self.gate_status()
         if status is None:
             return 0.0
-        return max(0.0, time.time() - float(status.get("started_at", 0.0)))
+        if status.get("phase") == "waiting_for_serial_gate":
+            return 0.0
+        started_at = status.get(
+            "running_started_at", status.get("started_at", 0.0)
+        )
+        return max(0.0, time.time() - float(started_at))
 
     def tail_log(self, max_chars: int = 4000) -> str:
         """Return the last `max_chars` characters of assistant text."""
@@ -181,6 +186,10 @@ class ProgrammerSession:
             "gate_python": sys.executable,
             "gate_cli": str(GATE_CLI),
             "gate_status_file": str(self._gate_status_path()),
+            "gate_serialization_lock": (
+                str(self.cfg.gate_serialization_lock_path)
+                if self.cfg.serialize_merge_gate else ""
+            ),
         }
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(cfg_payload, indent=2))

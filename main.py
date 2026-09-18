@@ -189,7 +189,8 @@ def parse_args() -> Config:
         "--provider", choices=SUPPORTED_API_PROVIDERS, default="subscription",
         help=(
             "model transport: subscription uses the logged-in Claude Code "
-            "Pro/Max allocation for every role; anthropic/deepseek use APIs"
+            "Pro/Max allocation for every role; anthropic/openrouter/deepseek "
+            "use APIs"
         ),
     )
     p.add_argument(
@@ -264,6 +265,7 @@ def parse_args() -> Config:
         build_timeout_sec = profile.build_timeout_sec
         test_timeout_sec = profile.test_timeout_sec
         gate_timeout_sec = profile.gate_timeout_sec
+        serialize_merge_gate = profile.serialize_merge_gate
         allowed_untracked = profile.gate_allowed_untracked_paths
         repo_allowed_untracked = profile.repo_allowed_untracked_paths
         profile_baseline_ref = profile.baseline_ref
@@ -292,6 +294,7 @@ def parse_args() -> Config:
         build_timeout_sec = 60 * 60
         test_timeout_sec = 60 * 60
         gate_timeout_sec = 3 * 60 * 60
+        serialize_merge_gate = False
         allowed_untracked = ()
         repo_allowed_untracked = ()
         profile_baseline_ref = ""
@@ -357,6 +360,7 @@ def parse_args() -> Config:
         build_timeout_sec=build_timeout_sec,
         test_timeout_sec=test_timeout_sec,
         gate_timeout_sec=gate_timeout_sec,
+        serialize_merge_gate=serialize_merge_gate,
         gate_allowed_untracked_paths=allowed_untracked,
         repo_allowed_untracked_paths=repo_allowed_untracked,
         run_id=args.run_id or time.strftime("%Y%m%d_%H%M%S"),

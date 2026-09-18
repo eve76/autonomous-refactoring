@@ -417,7 +417,18 @@ class Orchestrator:
                 "Claude Code subscription usage limit reached; resume this "
                 "run after the subscription window resets"
             )
-        if (
+        # Match the DeepSeek API path's tolerant tool-input semantics. Claude
+        # Code may reject a StructuredOutput envelope for an extra property
+        # and then hit the one-turn ceiling, even though the first typed
+        # decision is usable by our parser. In that exact case, accept the
+        # recovered tool input instead of failing the whole experiment.
+        recovered_first_decision = (
+            isinstance(structured_input, Mapping)
+            and not isinstance(terminal.get("structured_output"), Mapping)
+            and terminal.get("subtype") == "error_max_turns"
+            and terminal.get("stop_reason") == "tool_use"
+        )
+        if not recovered_first_decision and (
             result.returncode != 0
             or terminal.get("is_error") is True
             or not isinstance(structured_input, Mapping)

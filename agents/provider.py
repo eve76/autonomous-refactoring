@@ -1,7 +1,8 @@
 """LLM transport, subscription authentication, and child isolation.
 
 The default transport uses Claude Code's Claude.ai OAuth credentials. Optional
-Anthropic and DeepSeek API transports use the Anthropic SDK/wire format.
+Anthropic, OpenRouter, and DeepSeek API transports use the Anthropic SDK/wire
+format.
 Secrets are never inserted into argv or reproduction artefacts.
 """
 
@@ -26,6 +27,7 @@ _API_ENVIRONMENT_KEYS = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
+    "OPENROUTER_API_KEY",
 )
 
 
@@ -70,8 +72,8 @@ def agent_subprocess_environment(
     """Return the child environment for the selected CLI provider.
 
     Subscription mode removes API routing variables. Anthropic keeps normal
-    inheritance, while DeepSeek's documented variables are added only to a
-    private copy so the coordinator is not globally redirected.
+    inheritance, while gateway variables are added only to a private copy so
+    the coordinator is not globally redirected.
     """
     if cfg.api_provider == "subscription":
         # Claude Code OAuth/keychain credentials belong to the subscription.
@@ -93,16 +95,21 @@ def agent_subprocess_environment(
     child["ANTHROPIC_BASE_URL"] = cfg.effective_api_base_url
     child["ANTHROPIC_AUTH_TOKEN"] = key
     # Prevent an ambient Anthropic key from taking precedence over the
-    # provider-specific auth token in Claude Code.
-    child.pop("ANTHROPIC_API_KEY", None)
+    # provider-specific auth token in Claude Code. OpenRouter explicitly
+    # requires an empty value (not merely an unset variable).
+    if cfg.api_provider == "openrouter":
+        child["ANTHROPIC_API_KEY"] = ""
+    else:
+        child.pop("ANTHROPIC_API_KEY", None)
 
-    if cfg.api_provider == "deepseek":
+    if cfg.api_provider in ("deepseek", "openrouter"):
         child["ANTHROPIC_MODEL"] = cfg.agent_model
         child["ANTHROPIC_DEFAULT_OPUS_MODEL"] = cfg.agent_model
         child["ANTHROPIC_DEFAULT_SONNET_MODEL"] = cfg.agent_model
         child["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg.agent_model
         child["CLAUDE_CODE_SUBAGENT_MODEL"] = cfg.agent_model
-        child["CLAUDE_CODE_EFFORT_LEVEL"] = cfg.deepseek_effort
+        if cfg.api_provider == "deepseek":
+            child["CLAUDE_CODE_EFFORT_LEVEL"] = cfg.deepseek_effort
     return child
 
 

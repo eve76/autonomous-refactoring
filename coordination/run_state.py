@@ -39,6 +39,11 @@ class RunState:
     orchestrator_model: str = ""
     agent_model: str = ""
     optimization_fingerprint: str = ""
+    # This excludes only transport identity. It permits an explicitly audited
+    # subscription -> OpenRouter resume while preserving all experiment,
+    # measurement, scope, budget, and validation settings.
+    optimization_core_fingerprint: str = ""
+    provider_transitions: list[dict] = field(default_factory=list)
     # Immutable commit from which the run branch was created. Persist it
     # separately from a symbolic baseline such as HEAD: after a crash, HEAD
     # may point at the already-advanced integration branch.

@@ -13,6 +13,8 @@ from pathlib import Path
 _SUBSCRIPTION_QUOTA_MARKERS = (
     "usage limit reached",
     "usage limit",
+    "session limit",
+    "weekly limit",
     "hit your limit",
     "you've hit your limit",
     "you have hit your limit",

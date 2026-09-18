@@ -10,6 +10,7 @@ EXP = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(EXP))
 
 from coordination import token_usage as tu                              # noqa: E402
+from coordination.model_pricing import get_model_price                  # noqa: E402
 
 
 FAILURES = []
@@ -49,6 +50,13 @@ check("SDK objects are accepted",
       tu.normalize_usage(SimpleNamespace(
           input_tokens=7, output_tokens=5,
       ))["total_tokens"] == 12)
+openrouter_price = get_model_price(
+    "openrouter", "anthropic/claude-opus-5",
+)
+check("OpenRouter Opus slug resolves to the pinned equivalent price",
+      openrouter_price is not None
+      and openrouter_price.input_usd_per_mtok == 5.0
+      and openrouter_price.output_usd_per_mtok == 25.0)
 
 
 print("\n[2] CLI result aggregate and killed-session fallback")
@@ -170,7 +178,7 @@ with tempfile.TemporaryDirectory() as td:
     orch = root / "orchestrator.jsonl"
     tu.append_orchestrator_usage(
         orch, usage={"input_tokens": 30, "output_tokens": 5},
-        provider="anthropic", model="claude-opus-4-7", call_type="assignment",
+        provider="anthropic", model="claude-opus-5", call_type="assignment",
     )
     detail = root / "token_usage.json"
     summary = tu.build_token_artifacts(
@@ -178,7 +186,7 @@ with tempfile.TemporaryDirectory() as td:
         orchestrator_log=orch,
         detail_path=detail,
         provider="anthropic",
-        agent_model="claude-opus-4-7",
+        agent_model="claude-opus-5",
         successful_merges=1,
     )
     check("detailed artifact written", detail.exists())
@@ -259,7 +267,7 @@ with tempfile.TemporaryDirectory() as td:
         "total_cost_usd": 99.0,
         "usage": {"input_tokens": 1000, "output_tokens": 100},
         "modelUsage": {
-            "claude-opus-4-7": {
+            "claude-opus-5": {
                 "inputTokens": 1000,
                 "cacheReadInputTokens": 0,
                 "cacheCreationInputTokens": 0,
@@ -268,7 +276,7 @@ with tempfile.TemporaryDirectory() as td:
         },
     }) + "\n")
     record = tu._decorate_cost(tu.parse_agent_log(
-        log, provider="subscription", model="claude-opus-4-7",
+        log, provider="subscription", model="claude-opus-5",
     ))
     check("subscription ignores raw CLI cost as an actual charge",
           record["effective_cost_usd"] != 99.0

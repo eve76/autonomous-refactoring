@@ -7,7 +7,7 @@ Paper contract:
     unconditionally, WITHOUT asking;
   - only the hard timeout increments the stagnation counter.
 """
-import json, os, sys, tempfile, time
+import json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 from queue import Queue
 
@@ -261,6 +261,60 @@ with tempfile.TemporaryDirectory() as td:
     check("completed validation is subtracted from effective runtime",
           1495 <= session.runtime_sec() <= 1505,
           f"runtime={session.runtime_sec():.1f}")
+
+    now = time.time()
+    (cfg.gate_status_dir / "PROG_1.json").write_text(json.dumps({
+        "active": True,
+        "pid": os.getpid(),
+        "started_at": now - 400,
+        "accumulated_sec": 500,
+        "phase": "waiting_for_serial_gate",
+    }))
+    check("waiting for the serial gate is active but has no gate runtime",
+          session.gate_active() and session.gate_runtime_sec() == 0.0)
+    check("serial-gate wait does not consume model runtime",
+          1095 <= session.runtime_sec() <= 1105,
+          f"runtime={session.runtime_sec():.1f}")
+
+    (cfg.gate_status_dir / "PROG_1.json").write_text(json.dumps({
+        "active": True,
+        "pid": os.getpid(),
+        "started_at": now - 400,
+        "running_started_at": now - 50,
+        "accumulated_sec": 500,
+        "phase": "running",
+    }))
+    check("gate timeout starts only after the serial lock is acquired",
+          45 <= session.gate_runtime_sec() <= 55,
+          f"gate_runtime={session.gate_runtime_sec():.1f}")
+
+    from merge_gate.cli import _acquire_gate_lock, _release_gate_lock
+    lock_path = Path(td) / "serial-gate.lock"
+    first_lock = _acquire_gate_lock(lock_path)
+    child = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            (
+                "from pathlib import Path; "
+                "from merge_gate.cli import _acquire_gate_lock, "
+                "_release_gate_lock; "
+                f"h=_acquire_gate_lock(Path({str(lock_path)!r})); "
+                "print('acquired', flush=True); _release_gate_lock(h)"
+            ),
+        ],
+        cwd=str(EXP), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.2)
+        check("a second gate blocks while the first owns the run lock",
+              child.poll() is None)
+    finally:
+        _release_gate_lock(first_lock)
+    stdout, stderr = child.communicate(timeout=5)
+    check("the waiting gate proceeds after lock release",
+          child.returncode == 0 and stdout.strip() == "acquired",
+          stderr.strip())
 
 print("\n" + "="*62)
 print(f"FAILURES ({len(FAIL)}): " + "; ".join(FAIL) if FAIL else "ALL CHECKS PASSED")

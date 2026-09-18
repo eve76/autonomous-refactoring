@@ -67,7 +67,34 @@ class ClaudeCliRun:
 
     @property
     def structured_output(self):
-        return self.terminal.get("structured_output")
+        value = self.terminal.get("structured_output")
+        if isinstance(value, dict):
+            return value
+
+        # Claude Code validates --json-schema through its internal
+        # StructuredOutput tool.  Preserve the model's first typed decision
+        # even when the CLI rejects only its schema envelope (for example, an
+        # otherwise valid decision with an extra top-level property).  The
+        # orchestrator parser is intentionally tolerant in the same way as
+        # the DeepSeek API path.
+        for event in reversed(self.events):
+            if event.get("type") != "assistant":
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in reversed(content):
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == "StructuredOutput"
+                    and isinstance(block.get("input"), dict)
+                ):
+                    return block["input"]
+        return None
 
 
 def run_claude_once(

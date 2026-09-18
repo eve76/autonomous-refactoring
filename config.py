@@ -8,8 +8,12 @@ from analysis import tools
 from coordination.model_pricing import require_model_price
 
 
-SUPPORTED_API_PROVIDERS = ("subscription", "anthropic", "deepseek")
+SUPPORTED_API_PROVIDERS = (
+    "subscription", "anthropic", "openrouter", "deepseek",
+)
 DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+OPENROUTER_ANTHROPIC_BASE_URL = "https://openrouter.ai/api"
+OPENROUTER_OPUS_MODEL = "anthropic/claude-opus-5"
 
 
 @dataclass
@@ -35,7 +39,7 @@ class Config:
 
     claude_cli: str = "claude"
     # Subscription mode sends every model turn through an OAuth-authenticated
-    # Claude Code CLI. Anthropic/DeepSeek remain explicit API-backed modes.
+    # Claude Code CLI. Anthropic/OpenRouter/DeepSeek are explicit API modes.
     api_provider: str = "subscription"
     api_base_url: str = ""
     # Environment-variable *name* only. The secret value is read at runtime
@@ -202,6 +206,10 @@ class Config:
     # Last-resort bound for an active gate, including static analysis,
     # build, and test.  It must exceed both command-specific deadlines.
     gate_timeout_sec: int = 3 * 60 * 60
+    # Keep model work parallel while allowing memory-heavy validation to run
+    # one complete merge gate at a time. Production profiles decide whether
+    # this host-safety boundary is needed.
+    serialize_merge_gate: bool = False
     # Exact repository-relative paths that build tooling may create as
     # *untracked* files.  The merge gate still rejects tracked modifications,
     # and the list is empty by default.  This avoids teaching the gate broad
@@ -288,17 +296,19 @@ class Config:
             )
 
         if not self.orchestrator_model:
-            self.orchestrator_model = (
-                "deepseek-v4-pro"
-                if self.api_provider == "deepseek"
-                else "claude-opus-4-7"
-            )
+            if self.api_provider == "deepseek":
+                self.orchestrator_model = "deepseek-v4-pro"
+            elif self.api_provider == "openrouter":
+                self.orchestrator_model = OPENROUTER_OPUS_MODEL
+            else:
+                self.orchestrator_model = "claude-opus-5"
         if not self.agent_model:
-            self.agent_model = (
-                "deepseek-v4-pro[1m]"
-                if self.api_provider == "deepseek"
-                else "claude-opus-4-7"
-            )
+            if self.api_provider == "deepseek":
+                self.agent_model = "deepseek-v4-pro[1m]"
+            elif self.api_provider == "openrouter":
+                self.agent_model = OPENROUTER_OPUS_MODEL
+            else:
+                self.agent_model = "claude-opus-5"
         if self.max_run_cost_usd or self.max_run_cost_cny:
             require_model_price(self.api_provider, self.orchestrator_model)
             require_model_price(self.api_provider, self.agent_model)
@@ -348,6 +358,8 @@ class Config:
             return self.api_base_url
         if self.api_provider == "deepseek":
             return DEEPSEEK_ANTHROPIC_BASE_URL
+        if self.api_provider == "openrouter":
+            return OPENROUTER_ANTHROPIC_BASE_URL
         return ""
 
     @property
@@ -356,11 +368,11 @@ class Config:
             return ""
         if self.api_key_env:
             return self.api_key_env
-        return (
-            "DEEPSEEK_API_KEY"
-            if self.api_provider == "deepseek"
-            else "ANTHROPIC_API_KEY"
-        )
+        if self.api_provider == "deepseek":
+            return "DEEPSEEK_API_KEY"
+        if self.api_provider == "openrouter":
+            return "OPENROUTER_API_KEY"
+        return "ANTHROPIC_API_KEY"
 
     @property
     def target_path(self) -> Path:
@@ -413,6 +425,11 @@ class Config:
     def gate_status_dir(self) -> Path:
         """Run-scoped active-gate markers used by timeout supervision."""
         return self.run_results_path / "gate_status"
+
+    @property
+    def gate_serialization_lock_path(self) -> Path:
+        """Run-scoped advisory lock shared by every Programmer gate."""
+        return self.run_results_path / "merge-gate.lock"
 
     @property
     def baseline_build_log_path(self) -> Path:

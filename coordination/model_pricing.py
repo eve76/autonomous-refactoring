@@ -38,9 +38,9 @@ class ModelPrice:
 # caching, so cache writes are billed as cache-miss input rather than as a
 # separate class; both cache-write fields therefore use the miss price.
 _PRICES = {
-    ("anthropic", "claude-opus-4-7"): ModelPrice(
+    ("anthropic", "claude-opus-5"): ModelPrice(
         provider="anthropic",
-        model="claude-opus-4-7",
+        model="claude-opus-5",
         input_usd_per_mtok=5.0,
         cache_read_usd_per_mtok=0.5,
         output_usd_per_mtok=25.0,
@@ -125,9 +125,11 @@ _PRICES = {
 
 def canonical_model(provider: str, model: str) -> str:
     """Normalize provider aliases while retaining explicit model versions."""
-    if provider == "subscription":
+    if provider in ("subscription", "openrouter"):
         provider = "anthropic"
     value = str(model or "").strip().lower()
+    if value.startswith("anthropic/"):
+        value = value.removeprefix("anthropic/")
     if provider == "deepseek" and value.endswith("[1m]"):
         value = value[:-4]
     exact = (provider, value)
@@ -142,7 +144,9 @@ def canonical_model(provider: str, model: str) -> str:
 
 def get_model_price(provider: str, model: str) -> ModelPrice | None:
     provider = str(provider).strip().lower()
-    pricing_provider = "anthropic" if provider == "subscription" else provider
+    pricing_provider = (
+        "anthropic" if provider in ("subscription", "openrouter") else provider
+    )
     key = (pricing_provider, canonical_model(pricing_provider, model))
     return _PRICES.get(key)
 
